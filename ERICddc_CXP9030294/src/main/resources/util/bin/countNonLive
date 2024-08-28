@@ -1,0 +1,16 @@
+#!/bin/bash -a
+#
+
+UTIL_BIN=$(dirname $0)
+source ${UTIL_BIN}/getTorVer
+
+UTIL_JARS=$(/bin/ls /opt/ericsson/ERICddc/lib/*.jar | /bin/awk -F: '{ORS=":"; print}')
+
+for JAR in javax.persistence versant-jpa slf4j-api slf4j-log4j12 antlr-runtime asm-all jta ; do
+    JAR_PATH=$(find /opt/ericsson/ERICdpsupgrade/sut/lib -name "${JAR}*.jar" | tail -1)
+    if [ ! -z "${JAR_PATH}" ] ; then
+        CLASSPATH=${CLASSPATH}:${JAR_PATH}
+    fi
+done
+
+exec ${JAVA_HOME}/bin/java -server -Ds=countNonLive -Xmx2048m $JAVAFLAGS -cp ${UTIL_JARS}:${JBOSS_CLIENT}:$CLASSPATH com.ericsson.cifwk.diagmon.util.dps.NonLiveCounts $*

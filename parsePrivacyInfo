@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+
+sub main() {
+    my ( $fileList, $md );
+    my $result = GetOptions(
+        "fileList=s" => \$fileList,
+        "md=s"   => \$md,
+    );
+    ( $result == 1 ) or die "Invalid args";
+
+    my @data = <STDIN>;
+    createFiles( \@data, $fileList, $md );
+}
+
+sub createFiles($$$) {
+    my ( $r_data, $outFile, $mdFile ) = @_;
+
+    open(my $fh1, '>', $mdFile) or die "Could not open file '$mdFile' $!";
+    open(my $fh2, '>', $outFile) or die "Could not open file '$outFile' $!";
+
+    print $fh1 "|Filename|Description|Privacy Content|\n";
+    print $fh1 "|:---:|:---:|:---:|\n";
+    foreach my $line ( @{$r_data} ) {
+        if ( $line =~ /#FILE_INFO\s\{filename:"(.*?)",\sDescription:"(.*?)",\sprivacy_content:\[(.*?)\]\}/g) {
+            print $fh1 "| $1 | $2 | $3 |\n";
+            print $fh2 "$1\n";
+        } else {
+            print "ERROR: Input is incorrectly formatted: '$line'\n";
+            exit 1;
+        }
+    }
+    close $fh1;
+    close $fh2;
+}
+
+main();

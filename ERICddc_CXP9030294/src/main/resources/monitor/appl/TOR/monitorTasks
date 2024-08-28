@@ -1,0 +1,479 @@
+#!/bin/bash
+
+DDCDIR=$(/usr/bin/dirname $0)
+DDCDIR=$(cd ${DDCDIR}/../../.. ; pwd)
+
+source ${DDCDIR}/etc/global.env
+
+if [ -z "$1" ]; then
+    logErrorAndDie "Usage: $0 [START | STOP | TRIGGER | MAKETAR | INSTALL | UNINSTALL]"
+fi
+
+TASK=$1
+
+prechecks() {
+   # Set Jboss Config variables from jbossConfig
+   if [ -f ${DATAROOT}/${DATE}/server/jbossConfig ]; then
+       source ${DATAROOT}/${DATE}/server/jbossConfig
+   fi
+
+   if [ -z $JB_MANAGEMENT ]; then
+       JB_MANAGEMENT=127.0.0.1
+   fi
+
+   if [ -z $JB_MGT_NATIVE_PORT ]; then
+       JB_MGT_NATIVE_PORT=9999
+   fi
+
+   CLOUD_DEPLOYMENT="no"
+   if [ -r /ericsson/tor/data/global.properties ] ; then
+       $_EGREP '^DDC_ON_CLOUD=TRUE' /ericsson/tor/data/global.properties > /dev/null
+       if [ $? -eq 0 ] ; then
+           CLOUD_DEPLOYMENT="yes"
+       fi
+   fi
+}
+
+isMaster() {
+    if [ -z "${IS_DDC_MASTER}" ] ; then
+        if [ "${SERVER_TYPE}" = "MS" ]  ; then
+            IS_DDC_MASTER="yes"
+        elif [ -d /ericsson/enm/esmon/bin ] && [ "${CLOUD_DEPLOYMENT}" = "yes" ] ; then
+            IS_DDC_MASTER="yes"
+        else
+            IS_DDC_MASTER="no"
+        fi
+    fi
+}
+
+isVIO() {
+    if [ -d "${SITEDATAROOT}/vms_TOR/" ]; then
+        $_TOUCH ${SITEDATAROOT}/config/VIO
+    fi
+}
+
+doInit() {
+    verifyNasAvailable
+    verifyCloudInitDone
+    verifyJBossStarted
+
+    prechecks
+
+    isMaster
+    if [ "${IS_DDC_MASTER}" = "yes" ] ; then
+        CRONFILE=/etc/cron.d/ddc.TOR
+        if [ ! -r ${CRONFILE} ] ; then
+            $_ECHO "00 04,08,12,16,20 * * * root ${DDCDIR}/bin/ddc MAKETAR" >> ${CRONFILE} || logDDCWarning "Failed to add 4-hourly DDC MAKETAR cron job under ${CRONFILE}"
+        fi
+        isVIO
+    fi
+
+    # In pENM/vENM we collect from remotewriter on the ESMON VM
+    if [ -x /ericsson/enm/esmon/bin/remotewriter ] && [ ! -r /etc/ddc.d/config/DDC_REMOTE_WRITE_TO_FILE ] ; then
+        if [ ! -d /etc/ddc.d/config ] ; then
+            ${_MKDIR} -p /etc/ddc.d/config
+        fi
+        ${_ECHO} "http://localhost:1234" > /etc/ddc.d/config/OSS_METRICS_STAGER_URL
+        ${_ECHO} "http://localhost:9090" > /etc/ddc.d/config/PROMETHEUS_URL
+        ${_ECHO} "yes" > /etc/ddc.d/config/DDC_REMOTE_WRITE_TO_FILE
+    fi
+}
+
+doStart() {
+    logDebug "Starting"
+
+    prechecks
+    isMaster
+    if [ "${IS_DDC_MASTER}" = "yes" ] ; then
+        DDC_MASTER_DIR=""
+        if [ -r ${SITEDATAROOT}/config/DDC_MASTER_DIR ] ; then
+            DDC_MASTER_DIR=$($_CAT ${SITEDATAROOT}/config/DDC_MASTER_DIR)
+        fi
+        local MY_DIR=$($_BASENAME ${DATAROOT})
+        if [ "${DDC_MASTER_DIR}" != "${MY_DIR}" ] ; then
+            logInfo "Storing ${MY_DIR} in DDC_MASTER_DIR"
+            $_ECHO "${MY_DIR}" > ${SITEDATAROOT}/config/DDC_MASTER_DIR
+        fi
+
+        $_TOUCH ${DATAROOT}/${DATE}/DDC_MASTER
+    fi
+
+    # Make sure we're not already started
+    MONITOR_PID_LIST=$(${_PGREP} -f "Ds=instr.*${DATE}")
+    if [ ! -z "${MONITOR_PID_LIST}" ] ; then
+        logErrorAndDie "Monitor processes already running, aborting start: ${MONITOR_PID_LIST}"
+    fi
+
+    if [ ! -d ${DATAROOT}/${DATE}/TOR ] ; then
+        ${_MKDIR} ${DATAROOT}/${DATE}/TOR
+        if [ $? -ne 0 ] ; then
+            logErrorAndDie "Failed to create ${DATAROOT}/${DATE}/TOR"
+        fi
+    fi
+
+    # TORF-87066 Instr folder will not be removed during ddc restart or ddc upgrade.
+    if [ ! -d ${DATAROOT}/${DATE}/instr ] ; then
+        logInfo "Instr folder not present during ddc start."
+        ${_MKDIR} ${DATAROOT}/${DATE}/instr
+        [ $? -eq 0 ] && logInfo "instr folder successfully created during ddc start"
+        # Make it world writable to plugins can add files
+        ${_CHMOD} 777 ${DATAROOT}/${DATE}/instr
+    fi
+
+    if [ "${SERVER_TYPE}" != "MS" ]  ; then
+        SERVICE_GROUP=$(getServiceGroup)
+        initHaclusList
+        if [ "${HACLUS_LIST}" = "db_cluster" ] ; then
+            $_HAGRP -state | $_SORT > ${DATAROOT}/${DATE}/TOR/hagrp_state.txt
+        fi
+
+        # Keep this as early as possible in doStart so instr gets started
+        # as early as possible
+        createOrCopyInstrXmls "${SERVICE_GROUP}"
+
+        local FILE_COUNT=$(${_LS} ${DATAROOT}/config/instr | ${_WC} -l)
+        if [ "${FILE_COUNT}" -gt 0 ] ; then
+            startInstrExporter
+        fi
+
+        startMonitorDpsEvents
+        startMonitorFmEvents
+
+        startMonitorFmNbi
+    fi
+
+    collectHardwareSpec
+    createIloCfg
+
+    if [ -x "${_VIRTWHAT}" ] ; then
+        ${_VIRTWHAT} > ${DATAROOT}/${DATE}/TOR/virtwhat.txt
+    fi
+
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        # Create the config file that holds the path to master server's data directory
+        # In the short term we need to create both the old MS_DATA_ROOT_${DATE} as well
+        # as the new DDC_MASTER_DIR file to deal with the case where the system is being
+        # upgraded and we have a mix of DDC versions
+        # So check if the DDC_MASTER_DIR is "new"
+        DDC_MASTER_DIR_LAST_MOD=$(${_STAT} --format '%Y' ${SITEDATAROOT}/config/DDC_MASTER_DIR)
+        NOW=$($_DATE +%s)
+        DDC_MASTER_DIR_AGE=$($_EXPR ${NOW} - ${DDC_MASTER_DIR_LAST_MOD})
+        if [ ${DDC_MASTER_DIR_AGE} -lt 86400 ] ; then
+            # DDC_MASTER_DIR was modified in the last 24 hours
+            # Now see if we've MS_DATA_ROOT_ files from the 2 last day
+            ${_FIND} ${SITEDATAROOT}/config -name 'MS_DATA_ROOT_*' -mtime -2 > /dev/null
+            if [ $? -eq 0 ] ; then
+                # Okay looks we were using MS_DATA_ROOT_ so we need to create one
+                $_ECHO ${DATAROOT} > ${SITEDATAROOT}/config/MS_DATA_ROOT_${DATE} ||
+                    logWarning "Failed to create ${SITEDATAROOT}/config/MS_DATA_ROOT_${DATE} file"
+            fi
+        fi
+
+        # Create the 'clustered_data' directory
+        if [ ! -d ${DATAROOT}/${DATE}/TOR/${CLUSTEREDDATA} ] ; then
+            if [ ! -z "${DATAROOT}" ] ; then
+                $_MKDIR -p ${DATAROOT}/${DATE}/TOR/${CLUSTEREDDATA}
+            else
+                logWarning "Failed to create ${DATAROOT}/${DATE}/TOR/${CLUSTEREDDATA} directory"
+            fi
+        fi
+
+        collectConsulState
+        collectEnmHealthCheckOutput
+        collectSAN
+    fi
+
+    if [ "${SERVER_TYPE}" = "MS" ] ; then
+        $_ECHO "management_server" > ${OUTPUT_DIR}/tor_server_type
+    elif [ -d /opt/VRTSvcs ] ; then
+    # On physical server so it's probably a blade in a cluster
+        $_ECHO "OTHER" > ${OUTPUT_DIR}/tor_server_type
+    else
+        $_ECHO "virtual_machine" > ${OUTPUT_DIR}/tor_server_type
+    fi
+}
+
+doStop() {
+    logDebug "Stopping"
+
+    $_TOUCH ${DATAROOT}/${DATE}/instr.exit
+
+    stopJmsClients
+    stopMonitorFmNbi
+
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        # Remove old 'MS_DATA_ROOT_${DATE}' files
+        $_FIND ${SITEDATAROOT}/config/ -maxdepth 1 -mtime +2 -name "MS_DATA_ROOT_[0-9][0-9][0-9][0-9][0-9][0-9]" -delete
+        $_FIND ${SITEDATAROOT}/config/ -maxdepth 1 -mtime +2 -name "MS_DATA_ROOT" -delete
+
+        collectCpiAnnotationsFile
+        stopEnmHcOutputCollection
+    fi
+
+    # TORF-196558: Remove old clustered data directories, if any, created at wrong location
+    if [ -d /opt/VRTSvcs ] ; then
+        CLUST_DATA_DIRS=$($_LS / | $_GREP '^[0-9][0-9][0-9][0-9][0-9][0-9]$')
+        for CLUST_DATA_DIR in ${CLUST_DATA_DIRS} ; do
+            if [ ! -z "${CLUST_DATA_DIR}" ] && [ -d "/${CLUST_DATA_DIR}/TOR/${CLUSTEREDDATA}" ] ; then
+                CLUST_DATA_DIR_PATH="/${CLUST_DATA_DIR}"
+                logInfo "Removing unwanted clustered data directory '${CLUST_DATA_DIR_PATH}'"
+                $_RM -rf ${CLUST_DATA_DIR_PATH}
+            fi
+        done
+    fi
+}
+
+doShutdown() {
+    logDebug "Shutdown Starting"
+
+    if [ -r ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP ] ; then
+        SERVICE_GROUP=$(cat ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP)
+    fi
+
+    $_TOUCH ${DATAROOT}/config/instr/instr.exit
+
+    stopJmsClients
+    stopMonitorFmNbi
+
+    logDebug "Shutdown Completed"
+}
+
+doTrigger() {
+    logDebug "Triggering"
+    prechecks
+
+    $_TOUCH ${DATAROOT}/${DATE}/instr.trigger
+
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        checkDdcUploadFile
+        collectModClusterOutput
+    fi
+
+    if [ "${SERVER_TYPE}" = "MS" ] ; then
+        ${MONITORDIR}/common/scripts/vc ${DATAROOT}/${DATE} TRIGGER ${DATE} ${SITEDATAROOT}/config
+        collectPuppetStatus
+    else
+        # Regenerate Instr XML files if required
+        checkInstrXmls
+        verifyInstrStarted
+
+        collectVcsStatus
+
+        if [ -r ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP ] ; then
+            SERVICE_GROUP=$(cat ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP)
+        fi
+
+        # Each of the following functions should figure of if they
+        # are "applicable" (i.e. that what they are collecting information
+        # for is on this "server". The check should be as lightweight as possible
+        # (e.g. does file/directory exist) as these checks will run on all servers
+        collectVersantSpaceInfo
+        collectElasticSearchStats
+        collectEshistoryStats
+        collectSystemLogs "${TASK}"
+        collectPostgresStats
+        collectOpenAlarmCount
+        collectOpenDJ
+        collectJmsConnections
+        collectFLS ${DATAROOT}/${DATE}/server/tz.txt
+        collectUlsaFLS ${DATAROOT}/${DATE}/server/tz.txt
+        collectStatsLVS
+        collectJGroupsStats
+        collectNeo4jLeader
+        collectASR "${SERVICE_GROUP}"
+    fi
+}
+
+doMakeTar() {
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        triggerOnPeerNodes MAKETAR
+    fi
+}
+
+doStopAndMaketar() {
+    logDebug "Called stopAndMakeTar"
+
+    if [ "${TASK}" == "STOP" ] ; then
+        # STOP is called @ 23:59 so we want to wait here for 1 min
+        # to make sure we've reached the end of the say
+        # This is important for logs that we filter with "todays" date
+        sleep 60
+    fi
+
+    prechecks
+
+    # With reference to TORF-143188, lsblk output is collected only on bare metals
+    # Check if VCS is installed to determine if the host if "bare metal"
+    if [ -d /opt/VRTSvcs ] ; then
+        collectLsblkOutput
+    fi
+
+    collectEnmServerLogs
+    $_RPM -qi ${DDC_PACKAGE_NAME} > ${SERVER_DIR}/ERICddc.rpminfo 2>&1 # Store DDC rpm version
+
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        collectEnmVersion
+        collectEnmProperties
+        collectGlobalProperties
+        collectWorkflows
+        collectEnmDumpFileInfo
+        collectEsxiMetrics
+        collectPMFunctionFiles
+        collectASREnabledFields
+        collectPib
+        collectDeploymentType
+        collectConfigListing
+    fi
+
+    if [[ "${SERVER_TYPE}" == "MS" ]] ; then
+        collectEnmHistoryFile
+        collectVappGatewayHostname
+        collectLitpVersion
+        collectDeploymentDescription
+        collectEnmDeploymentFile
+    elif [ -d /opt/VRTSvcs ] ; then
+        # On physical server so it's probably a blade in a
+        # cluster
+        collectVcsInfo
+    fi
+
+    if [ -r ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP ] ; then
+        SERVICE_GROUP=$(cat ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP)
+    fi
+
+    # Each of the following functions should figure of if they
+    # are "applicable" (i.e. that what they are collecting information
+    # for is on this "server". The check should be as lightweight as possible
+    # (e.g. does file/directory exist) as these checks will run on all servers
+    collectSmrsSftpLog
+    collectJbossLogs
+    collectJBossSG
+    collectJbossLoggingConfig
+    collectSolrCoreStatus
+    collectConfigLVS
+    collectESMData
+    collectVersantLogs
+    collectNeo4j
+    collectSystemLogs "${TASK}"
+    collectSutLogs
+    collectJmsState
+    collectFLS ${DATAROOT}/${DATE}/server/tz.txt
+    collectUlsaFLS ${DATAROOT}/${DATE}/server/tz.txt
+    collectOpendjLogs
+    collectBurLogs
+    collectRPMInfo
+    rotateInstr
+    collectMySQLLogs
+    collectCapacityInfo
+    collectCmLog "${SERVICE_GROUP}"
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        collectPeerArchives
+    fi
+}
+
+doMakeDelta() {
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        triggerOnPeerNodes DELTA
+    fi
+
+
+    # Set DELTA_ROOT to tell delta functions where to write
+    DELTA_ROOT=$($_CAT ${SITEDATAROOT}/config/DELTA_ROOT)
+
+    # If phyical / vENM deployments make sure the delta directory
+    # for this host exists
+    if [ "${SITEDATAROOT}" != "${DATAROOT}" ] ; then
+        local DELTA_DIR=${DELTA_ROOT}/$($_BASENAME ${DATAROOT})
+        if [ ! -d ${DELTA_DIR} ] ; then
+            logErrorAndDie "DELTA: Directory not found ${DELTA_DIR}"
+        fi
+    fi
+
+    rotateInstr
+    if [ -r ${DATAROOT}/${DATE}/instr.index ] ; then
+        FILE_INDEX=$($_CAT ${DATAROOT}/${DATE}/instr.index)
+        ROTATE_TO_FILE=$(printf "%s.%03d" ${DATAROOT}/${DATE}/instr.txt ${FILE_INDEX})
+        $_CP ${ROTATE_TO_FILE} ${DELTA_DIR}
+    fi
+
+    if [ -r ${DATAROOT}/${DATE}/DDC_MASTER ] ; then
+        deltaCollectElasticsearch
+        deltaCollectFLS
+        deltaCollectUlsaFLS
+        waitDeltaOnPeerNodes
+    fi
+}
+
+doSideCar() {
+    if [ ! -z "${SGNAME}" ] ; then
+        SERVICE_GROUP=${SGNAME}
+    elif [ ! -z "${SERVICENAME}" ] ; then
+        SERVICE_GROUP=${SERVICENAME}
+    else
+        echo "ERROR: SERVICENAME is not defined"
+        return
+    fi
+
+    if [ -z "${JMX_SERVICE_URL}" ] && [ -z "${DDC_JVM_LIST}" ]; then
+        echo "ERROR: Either DDC_JVM_LIST or JMX_SERVICE_URL must be defined"
+        return
+    fi
+
+    if [ -z "${INSTR_EXPORTER_PORT}" ] ; then
+        echo "ERROR: INSTR_EXPORTER_PORT is not defined"
+        return
+    fi
+
+    DATAROOT=/var/tmp/ddc_data
+    ${_MKDIR} -p ${DATAROOT}/instr
+    ${_MKDIR} -p ${DATAROOT}/TOR
+
+    IS_CLOUD_NATIVE="yes"
+
+    # We need to get instr up and running ASAP so that it can respond to the
+    # liveness probes
+    POD_IP=$(getLocalIp)
+    $_ECHO "POD_IP=$POD_IP"
+    EXPORTER_ADDRESS=${POD_IP}:${INSTR_EXPORTER_PORT}
+    setInstrClassPath
+    ${UTILDIR}/bin/instr -basedir ${DATAROOT} -pollDir ${DATAROOT}/instr -exporter ${EXPORTER_ADDRESS} &
+
+    waitMonitoredJvmsReady
+
+    # As we're not running as a service, we need to "manually" create
+    # the pid file (needed by checkInstrXmls)
+    $_ECHO $$ > /var/run/ddc.pid
+
+    #
+    # Because we've already started instr, we can't use createInstrXmls because
+    # instr will react to the XML files being written, i.e. we would have a race
+    # condition between writing the XMLs and instr reading them, risking the read
+    # failing because the file is still being written
+    # regenerateInstrXmls was designed to deal with that so we use that instead.
+    #
+    local SLEEP_DURATION=60
+    local MAX_SLEEP_DURATION=86400
+    while : ; do
+        regenerateInstrXmls ${DATAROOT}/instr
+
+        ${_SLEEP} ${SLEEP_DURATION}
+        if [ ${SLEEP_DURATION} -lt ${MAX_SLEEP_DURATION} ] ; then
+            SLEEP_DURATION=$($_EXPR ${SLEEP_DURATION} + ${SLEEP_DURATION})
+            if [ ${SLEEP_DURATION} -gt ${MAX_SLEEP_DURATION} ] ; then
+                SLEEP_DURATION=${MAX_SLEEP_DURATION}
+            fi
+        fi
+    done
+}
+
+case $TASK in
+    "INIT") doInit ;;
+    "START") doStart ;;
+    "STOP") doStopAndMaketar ; doStop ;;
+    "TRIGGER") doTrigger ;;
+    "MAKETAR") doMakeTar ; doStopAndMaketar ;;
+    "SHUTDOWN") doShutdown ;;
+    "DELTA") doMakeDelta ;;
+    "DEFAULT") doError ;;
+    "SIDECAR") doSideCar ;;
+esac

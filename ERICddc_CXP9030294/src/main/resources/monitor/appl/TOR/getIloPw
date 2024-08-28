@@ -1,0 +1,6 @@
+#!/bin/bash
+
+HOST_KEY=$1
+
+PASSWORD=$(/usr/bin/egrep "^esxi_${HOST_KEY}_ilo_password" /vol1/senm/etc/deploy_sed.yml | /usr/bin/awk '{print $2}' | /usr/bin/sed 's/"//g')
+/usr/bin/echo -n "${PASSWORD}"

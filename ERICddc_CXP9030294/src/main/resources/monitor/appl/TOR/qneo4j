@@ -1,0 +1,466 @@
+#!/bin/bash
+"true" '''\'
+P=$(which python3 2>/dev/null) || P=$(which python); exec $P "$0" "$@"
+'''
+
+import getopt
+import time
+import requests
+import logging
+import json
+import re
+import base64
+import subprocess
+import os
+import sys
+
+
+class TokenRequestFailed(Exception):
+    pass
+
+
+class PasskeyRequestFailed(Exception):
+    pass
+
+
+class Neo4jConnection:
+    def __init__(self, base_url, user = None, password = None):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'application/json',
+            'Content-Type':'application/json'
+        })
+        if user is not None:
+            logging.debug("Neo4jConnection._init_: setting auth for %s", user)
+            self.session.auth =  (user, password)
+
+        # Assume we're on neo4j 3, we have to have a value set for version to call exec_query
+        self.version = [ '3' ]
+        result = self.exec_query("CALL dbms.components()")
+        version_str = result["data"][0]["row"][1][0]
+        self.version = version_str.split(".")
+        logging.info('Neo4jConnection.__init__: version=%s', self.version)
+
+    def exec_query(self, query):
+        logging.info('Neo4jConnection.exec_query: query=%s', query)
+
+        query_param = {
+            "statements" : [
+                {"statement" : query}
+            ]
+        }
+        if self.version[0] == '3':
+            endpoint = 'db/data/transaction/commit'
+        else:
+            endpoint = 'db/dps/tx/commit'
+
+        reply = self.request(endpoint, query_param)
+        return reply['results'][0]
+
+    def count_query(self, match_where):
+        logging.info('Neo4jConnection.count_query: match_where=%s', match_where)
+        results = self.exec_query("{0} RETURN COUNT(m)".format(match_where))
+        assert len(results['data']) == 1, "Invalid reply from neo4j, len(data) != 1"
+        return results['data'][0]['row'][0]
+
+    def request(self, endpoint, data):
+        logging.info('Neo4jConnection.request: endpoint=%s', endpoint)
+        url = self.base_url + endpoint
+        if data is None:
+            response = self.session.get(url)
+        else:
+            response = self.session.post(url, json=data)
+        content_type =  response.headers['content-type']
+        logging.info('Neo4jConnection.request: status_code=%s content_type=%s reply_content=%s', response.status_code, content_type, response.text)
+        response.raise_for_status()
+        if  content_type ==  'application/json':
+            return response.json()
+        else:
+            return response.text
+
+
+def get_token_from_vaultservice(vault_addr):
+    retries = 3
+    err = None
+    while True:
+        if retries <= 0:
+            raise TokenRequestFailed('Failed to retrieve token from Vault '
+                                     'Service: %s' % err)
+        try:
+            response = requests.get("%s/token" % vault_addr, verify=False)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.RequestException) as err:
+            logging.debug('Failed to retrieve token from Vault Service: %s.'
+                          'Trying again...' % err)
+            retries -= 1
+            time.sleep(2)
+            continue
+        else:
+            if response.status_code == 200 and response.text:
+                logging.info("Retrieved token from Vault Service.")
+                return response.text
+            logging.debug('Failed to retrieve token from Vault Service: '
+                          'status code: %s, response: %s' %
+                         (response.status_code, response.text))
+            retries -= 1
+            time.sleep(2)
+    raise TokenRequestFailed('Failed to retrieve token from Vault Service')
+
+
+def get_passkey_from_vault(vault_addr):
+    vault_token = get_token_from_vaultservice(vault_addr)
+    headers = {'Vault-Token': vault_token}
+    response = requests.get("%s/secret/neo4j_pk" % vault_addr,
+                            headers=headers, verify=False)
+    if response.status_code == 200:
+        result = response.json()
+        if 'errors' in result:
+            raise PasskeyRequestFailed("Errors retrieving Neo4j Passkey "
+                                       "from Vault service: %s" %
+                                       str(result['errors']))
+        vault_passkey_value = result.get('data', {}).get('passkey')
+        if not vault_passkey_value:
+            raise PasskeyRequestFailed("Value for Neo4j Passkey is "
+                                       "empty: %s" % str(result))
+        logging.info("Retrieved Neo4j Passkey from Vault service.")
+        return vault_passkey_value
+    raise PasskeyRequestFailed('Failed to retrieve passkey from Vault '
+                               'Service: status code: %s, response: %s' %
+                               (response.status_code, response.text))
+
+
+def get_consul_value(session, consul_addr, key):
+    if consul_addr is None:
+      consul_addr = 'localhost'
+    url = 'http://%s:8500/v1/kv/enm/deployment/databases/neo4j/%s' % (consul_addr, key)
+
+    try:
+        response = session.get(url)
+        if response.status_code == 404:
+            return None
+        query_reply = response.json()
+        consul_value = base64.b64decode(query_reply[0]['Value']).decode('utf-8')
+        logging.info("get_consul_value: consul_value=%s", consul_value)
+        return consul_value
+    except requests.exceptions.ConnectionError as e:
+        return None
+
+def get_encrypted_passwd_global_props():
+    with open("/ericsson/tor/data/global.properties") as myfile:
+        for line in myfile:
+            name, val = line.partition('=')[::2]
+            if name == 'neo4j_reader_user_password':
+                return val
+    return None
+
+def get_passwd(consul):
+    # Check if the password is available in a file (cENM)
+    if os.path.isfile('/etc/app-volume/neo4j-password'):
+        with open('/etc/app-volume/neo4j-password') as myfile:
+            password = myfile.read()
+    else:
+        session = requests.Session()
+        session.headers.update({
+            'Accept': 'application/json',
+            'Content-Type':'application/json'
+        })
+        # Try get the password from consul (vENM)
+        encrpyted_passwd = get_consul_value(session, consul, 'neo4j_reader_user_password')
+        if encrpyted_passwd is None:
+            # Try get the password from global.properties (Phys env)
+            encrpyted_passwd = get_encrypted_passwd_global_props()
+        if encrpyted_passwd is None:
+            # No encrpyted_passwd so assume no password
+            return None
+
+        logging.info("get_passwd: encrpyted_passwd=%s" % encrpyted_passwd)
+
+        # Passkey has move from a file to consul, so try consul first
+        # and if it's not in consul assume the file is available
+        is_neo_hardened = get_consul_value(session, consul,
+                                           'neo4j_hardened') == 'true'
+        if is_neo_hardened:
+            logging.info('Getting PASSKEY')
+            vault_addr = "https://vault-service:8107/vault-service/1.0"
+            passkey = get_passkey_from_vault(vault_addr)
+        else:
+            logging.info('Getting PASEO')
+            passkey = get_consul_value(session, consul, 'paseochair')
+
+        if passkey is None:
+            passarg = "file:/ericsson/tor/data/idenmgmt/neo4j_passkey"
+        else:
+            passarg = "pass:%s" % passkey
+
+        # Use openssl enc command to get the clear text password
+        cmd = [ "/usr/bin/openssl", "enc", "-aes-128-cbc", "-d", "-a", "-A", "-md", "md5",
+                "-pass",  passarg ]
+        logging.info("get_passwd: cmd=%s" % str(cmd))
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        password = process.communicate(encrpyted_passwd.encode('utf-8'))[0].rstrip()
+        password = password.decode()
+
+    logging.info("get_passwd: password=" + password)
+
+    return password
+
+
+def restructure_data(results):
+    # Restructure the data to be compatible with the old cypher format
+    data = []
+    for result in results['data']:
+        data.append(result['row'])
+    results['data'] = data
+
+
+def get_subscription_content(neo4j_conn, query_template, subscription_id):
+    results = neo4j_conn.exec_query(query_template.format(subscription_id))
+    restructure_data(results)
+    return results['data']
+
+
+def get_pmic_mo(neo4j_conn, dir):
+    query_attr_list = []
+    for attr in [ 'errorCode', 'status', 'subscriptionId' ]:
+        query_attr_list.append('m.`{0}`'.format(attr))
+    query = "MATCH (m:`pmic_subscription:PMICScannerInfo`) WHERE m.` _bucket` = 'Live' return {0}".format(",".join(query_attr_list))
+    query_results = neo4j_conn.exec_query(query)
+    restructure_data(query_results)
+    out_file = dir + "/PMICScannerInfo"
+    f = open(out_file, "w")
+    f.write(json.dumps(query_results))
+    f.close()
+
+    query_attr_list = []
+    for attr in [ ' _internalId', ' _s:events', ' _s:counters', ' _name', ' _fdn', 'type', 'administrationState', 'rop', 'numberOfNodes', 'cellTraceCategory', ' _s:ebsCounters' ]:
+        query_attr_list.append('m.`{0}`'.format(attr))
+    query = "MATCH (m:`pmic_subscription:Subscription`) WHERE m.` _bucket` = 'Live' return {0}".format(",".join(query_attr_list))
+    subscriptions_query_results = neo4j_conn.exec_query(query)
+    events_query = """
+MATCH (p:PersistenceObject)-[r:list_cdt|list_cdt_next*]->(cdt)
+WHERE (p.` _internalId` = {0})
+AND head(r).` _c` = 'events'
+RETURN cdt.groupName, cdt.name
+"""
+    counters_query = """
+MATCH (p:PersistenceObject)-[r:list_cdt|list_cdt_next*]->(cdt)
+WHERE (p.` _internalId` = {0})
+AND head(r).` _c` = 'counters'
+RETURN cdt.moClassType, cdt.name
+"""
+    ebsCounters_query = """
+MATCH (p:PersistenceObject)-[r:list_cdt|list_cdt_next*]->(cdt)
+WHERE (p.` _internalId` = {0})
+AND head(r).` _c` = 'ebsCounters'
+RETURN cdt.moClassType, cdt.name
+"""
+    for subscriptions_query_result in subscriptions_query_results['data']:
+        subscription = subscriptions_query_result['row']
+        if subscription[1] is not None:
+            subscription[1] = get_subscription_content(neo4j_conn, events_query, subscription[0])
+        elif subscription[2] is not None:
+            subscription[2] = get_subscription_content(neo4j_conn, counters_query, subscription[0])
+        # subscription containing events and ebsCounters are not mutually exclusive, file-based ebs counter subscriptions are expected to contain events
+        if subscription[10] is not None:
+            subscription[10] = get_subscription_content(neo4j_conn, ebsCounters_query, subscription[0])
+
+    restructure_data(subscriptions_query_results)
+
+    out_file = dir + "/Subscription"
+    f = open(out_file, "w")
+    f.write(json.dumps(subscriptions_query_results))
+    f.close()
+
+
+def get_mo(neo4j_conn, dir):
+    mo_attr = {
+        'OSS_NE_CM_DEF:CmNodeHeartbeatSupervision': [ 'active' ],
+        'OSS_NE_CM_DEF:CmFunction': [ 'syncStatus' ],
+        'OSS_NE_FM_DEF:FmAlarmSupervision': [ 'active' ],
+        'OSS_NE_FM_DEF:FmFunction': [ 'currentServiceState' ],
+        'CM:InventorySupervision': [ 'active' ],
+        'COM_MED:ComConnectivityInformation': [ 'fileTransferProtocol' ],
+        'OSS_NE_SHM_DEF:InventoryFunction': [ 'syncStatus' ],
+        'OSS_NE_DEF:NetworkElement' : [ 'neType', 'platformType', 'ossPrefix', 'ossModelIdentity', 'technologyDomain', 'nodeModelIdentity', 'release' ],
+        'OSS_NE_PM_DEF:PmFunction': [ 'pmEnabled' ]
+    }
+    for mo, attr_list in mo_attr.items():
+        query_attr_list = [ 'm.` _fdn`', 'm.` _bucket`' ]
+        for attr in attr_list:
+            query_attr_list.append('m.`{0}`'.format(attr))
+
+        if mo == 'OSS_NE_DEF:NetworkElement':
+            # TORF-415605
+            query_template="""MATCH (m:`{0}`)
+OPTIONAL MATCH (m)-[:list_cdt{{ ` _c`: "neProductVersion"}}]->(p)
+RETURN {1}, [p.identity, p.revision] as neProductVersion"""
+            query = query_template.format(mo,",".join(query_attr_list))
+        else:
+            query = 'MATCH (m:`{0}`) return {1}'.format(mo,",".join(query_attr_list))
+
+        results = neo4j_conn.exec_query(query)
+        restructure_data(results)
+        out_file = dir + "/" + mo
+        f = open(out_file, "w")
+        f.write(json.dumps(results))
+        f.close()
+
+def process_mo_counts_v1(results):
+    counts = {}
+    for result in results['data']:
+        row = result['row']
+        label = row[0]
+        instances = row[1]
+        label_parts = label.split(":")
+        if label_parts[0] == "NonLive":
+          label_parts.pop(0)
+          label = ":".join(label_parts)
+          type = 'nonlive'
+        else:
+          type = 'live'
+
+        if label in counts:
+          count = counts[label]
+        else:
+          count = { 'live': 0, 'nonlive': 0 }
+          counts[label] = count
+
+        count[type] = instances
+
+    for label, count in counts.items():
+      print(label + " " + str(count['live'] + count['nonlive']) + " " + str(count['nonlive']))
+
+def process_mo_counts_v2(results):
+    counts = {}
+    for result in results['data']:
+        row = result['row']
+        bucket = row[0]
+        namespace = row[1]
+        typename = row[2]
+        totalCount = row[3]
+
+        key = "{0}@{1}".format(namespace, typename)
+        if key in counts:
+          count = counts[key]
+        else:
+          count = { 'Live': 0, 'NonLive': 0 }
+          counts[key] = count
+
+        count[bucket] = totalCount
+
+    for key, count in counts.items():
+      print(key + " " + str(count['Live'] + count['NonLive']) + " " + str(count['NonLive']))
+
+def get_mo_counts(neo4j_conn):
+    results = neo4j_conn.exec_query("CALL ericsson.driver.get_instances_count()")
+    if len(results['columns']) == 2:
+        process_mo_counts_v1(results)
+    else:
+        process_mo_counts_v2(results)
+
+def cluster_overview(neo4j_conn):
+    result = neo4j_conn.exec_query("CALL dbms.cluster.overview()")
+
+    for data in result['data']:
+        row = data['row']
+        logging.debug(':cluster_overview row=%s', row)
+        m = re.search('//(\S+):\d+$', row[1][0])
+        if neo4j_conn.version[0] == '3':
+            print('{0}:{1}:{2}'.format(m.group(1),row[2],row[0]))
+        else:
+            print("{0}:{1}:{2}:{3}".format(m.group(1),row[2]["dps"],row[0],row[2]["system"]))
+
+def is_writable(neo4j_conn,):
+    try:
+        if neo4j_conn.version[0] == '3':
+            endpoint = 'db/manage/server/core/writable'
+        else:
+            endpoint = 'db/dps/cluster/writable'
+        result = neo4j_conn.request(endpoint, None)
+        print (str(result))
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print("false")
+        else:
+            raise
+
+def alarms_open_count(neo4j_conn):
+    count = neo4j_conn.count_query("MATCH (m:`FM:OpenAlarm`)")
+    print(count)
+
+def main():
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "v", ['ip=', 'action=', 'dir=', 'consul='])
+    except getopt.GetoptError as err:
+        print(str(err))
+        sys.exit(1)
+
+    log_level = logging.WARN
+    base_url = ''
+    ip = ''
+    dir = ''
+    consul = None
+    action = ''
+    for o, a in opts:
+        if o == "-v":
+            if log_level == logging.WARN:
+                log_level = logging.INFO
+            else:
+                log_level = logging.DEBUG
+        elif o == '--ip':
+            ip = a
+        elif o == '--action':
+            action = a
+        elif o == '--dir':
+            dir = a
+        elif o == '--consul':
+            consul = a
+
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s',
+                        level=log_level)
+
+    if ip == '':
+        with open("/ericsson/3pp/neo4j/conf/neo4j.conf") as myfile:
+            for line in myfile:
+                name, val = line.partition('=')[::2]
+                if name == 'dbms.connector.http.advertised_address':
+                    ip, port = val.partition(':')[::2]
+
+    base_url = 'http://{0}:7474/'.format(ip)
+    logging.info('base_url=%s' % base_url)
+
+    user = None
+    try:
+        password = get_passwd(consul)
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+            TokenRequestFailed, PasskeyRequestFailed) as e:
+        logging.error("Error trying to retrieve Neo4j Password: %s: %s" %
+                      (e.__class__.__name__, e))
+        return 1
+
+    if password is not None:
+        user = 'reader_user'
+    neo4j_conn = Neo4jConnection(base_url, user, password)
+
+    if not action:
+        print('--action not provided')
+        return 2
+
+    if action == 'counts':
+        get_mo_counts(neo4j_conn)
+    elif action == 'writable':
+        is_writable(neo4j_conn)
+    elif action == 'cluster_overview':
+        cluster_overview(neo4j_conn)
+    elif action == 'get_mo':
+        get_mo(neo4j_conn,dir)
+    elif action == 'alarms_open_count':
+        alarms_open_count(neo4j_conn)
+    elif action == 'get_pmic_mo':
+        get_pmic_mo(neo4j_conn,dir)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,17 @@
+#!/bin/bash -a
+#
+
+UTIL_BIN=$(dirname $0)
+source ${UTIL_BIN}/getTorVer
+
+# Add in JMX
+JAVAFLAGS="${JAVAFLAGS} -Dcom.sun.management.jmxremote"
+CLASSPATH=${JAVA_HOME}/lib/tools.jar:${CLASSPATH}
+
+UTIL_JARS=$(/bin/ls /opt/ericsson/ERICddc/lib/*.jar | /bin/awk -F: '{ORS=":"; print}')
+JBOSS_CLIENT=/ericsson/3pp/jboss/bin/client/jboss-client.jar
+DPS_JAR_PATH=$2
+
+CMD="${JAVA_HOME}/bin/java -server -Ds=jmsclient -Xmx256m $JAVAFLAGS -cp ${DPS_JAR_PATH}:${UTIL_JARS}:${JBOSS_CLIENT}:$CLASSPATH com.ericsson.cifwk.diagmon.util.jms.JmsClient $*"
+
+exec ${CMD}

@@ -1,0 +1,124 @@
+#!/bin/bash
+
+COMMON_MONITORDIR=$(dirname $0)
+COMMON_MONITORDIR=$(cd ${COMMON_MONITORDIR} 2>/dev/null && pwd || echo ${COMMON_MONITORDIR})
+DDCDIR=$(cd ${COMMON_MONITORDIR}/../../ 2>/dev/null && pwd || echo ${COMMON_MONITORDIR}/../../)
+
+[ -f ${DDCDIR}/etc/global.env ] && source ${DDCDIR}/etc/global.env
+
+OUTPUT_DIR=${DATAROOT}/${DATE}
+
+if [ -z "$1" ]; then
+    logErrorAndDie "Usage: $0 [START | STOP | TRIGGER | MAKETAR | INSTALL | UNINSTALL]"
+fi
+
+TASK=$1
+
+doInit() {
+    logDebug "Initiating"
+}
+
+doStart() {
+    logDebug "Starting"
+    export DDC_AGENT_LOGLEVEL="DEBUG"
+    # Commented out because agentserver isn't needed on ENM.
+    # ${COMMON_MONITORDIR}/scripts/agentserver ${OUTPUT_DIR}/agentserver.txt ${OUTPUT_DIR}/agentserver.exit 24 >> ${OUTPUT_DIR}/agentserver.log 2>&1 &
+    [ -f ${COMMON_DIR}/SunDsLDAP_Running ] && $_RM -f ${COMMON_DIR}/SunDsLDAP_Running
+    checkForSunDS
+}
+
+doStop() {
+    logDebug "Stopping"
+
+    [ -d /var/sadm/pkg/ERICcaas ] && collectCaasLogs
+    $_TOUCH ${OUTPUT_DIR}/agentserver.exit
+}
+
+doShutdown() {
+    logDebug "Shutting down"
+    $_TOUCH ${OUTPUT_DIR}/agentserver.exit
+}
+
+doTrigger() {
+    logDebug "Triggering"
+    [ -f ${COMMON_DIR}/SunDsLDAP_Running ] && collectSUNDSLDAPInfo
+}
+
+doMakeTar() {
+    logDebug "Making tar"
+}
+
+doMakeDelta() {
+    logDebug "Making delta"
+}
+
+doStopAndMaketar() {
+    logDebug "Called stopAndMakeTar"
+}
+
+#
+# Collect SUNDS LDAP monitorCounter information
+# IP: 603/159 41/FCP-103 8147
+# WI: 1.4
+#
+COMMON_DIR=${OUTPUT_DIR}/common
+
+checkForSunDS() {
+    if [ -d /var/sadm/pkg/EXTRsdse ] ; then
+        [ ! -d ${COMMON_DIR} ] && $_MKDIR ${COMMON_DIR}
+        SUNDSLDAPCHECK=${COMMON_DIR}/SunDsLDAP_Running
+        [ ! -f ${SUNDSLDAPCHECK} ] && $_TOUCH ${SUNDSLDAPCHECK}
+    else
+        $_RM -f ${SUNDSLDAPCHECK}
+    fi
+}
+
+collectSUNDSLDAPInfo() {
+    SUNDSLDAPLOG=${COMMON_DIR}/SunDsLDAPMonitor.log
+    [ ! -f ${SUNDSLDAPLOG} ] && $_TOUCH ${SUNDSLDAPLOG}
+    $_ECHO "${TIMESTAMP}" >> ${SUNDSLDAPLOG} # Write timestamp to file
+
+    SUNDSLDAPBIND_ID="cn=ddc,dc=globaldomain"
+    SUNDSLDAPBIND_PW="ddc_monitor"
+
+    # Get LDAP Server hostname
+    SUNDSLDAPSERVER=$(hostname) # Need to check if this will work, is command running on LDAP server or client [RK]
+
+    if [ ! -z "${SUNDSLDAPSERVER}" ] ; then
+        SUNDSLDAPSEARCH="/bin/ldapsearch -h ${SUNDSLDAPSERVER} -1 -T"
+        ${SUNDSLDAPSEARCH} -w ${SUNDSLDAPBIND_PW} -D "${SUNDSLDAPBIND_ID}" -b "cn=monitor" "(|(cn=disk*)(cn=snmp)(cn=monitor))" >> ${SUNDSLDAPLOG} 2>&1
+        ${SUNDSLDAPSEARCH} -w ${SUNDSLDAPBIND_PW} -D "${SUNDSLDAPBIND_ID}" -b "cn=ldbm database,cn=plugins,cn=config" "(|(objectclass=nsBackendInstance)(cn=monitor))" dn nsslapd-suffix nsslapd-cachesize nsslapd-cachememsize dbcachehitratio dbcachepagein dbcacheroevict dbentrycount ldapentrycount entrycachehits entrycachetries entrycachehitratio currententrycachesize maxentrycachesize currententrycachecount maxentrycachecount >> ${SUNDSLDAPLOG} 2>&1
+    fi
+}
+
+#
+# CR 39/109 18- FCP 121 9272 - ISP for CAAS
+# Collection of Caas Performance log files from COMInf Server.
+# The file is owned by caas local user, therefore DCC has to log in as root to fetch the file.
+#
+collectCaasLogs(){
+    SRCDIR="/var/caas_perf"
+    FILES="caas_performance"
+    ERIC_USE_CFG="/ericsson/config/ericsson_use_config"
+
+    if [ -f ${ERIC_USE_CFG} ] ; then
+        SERVER_TYPE=$($_EGREP "config=" ${ERIC_USE_CFG} | $_SED 's/[\/=]/ /g' | $_AWK '{print $2}')
+        if [ ${SERVER_TYPE} == "om_serv_master" ] || [ ${SERVER_TYPE} == "om_serv_slave" ] ; then
+            if [ -d ${SRCDIR} ] ; then
+                $_CP ${SRCDIR}/caas_performance ${COMMON_DIR} > /dev/null 2>&1
+            fi
+        fi
+    fi
+}
+
+
+case $TASK in
+    "INIT") doInit ;;
+    "START") doStart ;;
+    "STOP") doStop ;;
+    "TRIGGER") doTrigger ;;
+    "MAKETAR") doMakeTar ;;
+    "SHUTDOWN") doShutdown ;;
+    "DELTA") doMakeDelta ;;
+    "DEFAULT") doError ;;
+esac

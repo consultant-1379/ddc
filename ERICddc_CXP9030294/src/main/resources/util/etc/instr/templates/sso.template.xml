@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Rory Kelly</createdBy>
+    <!-- this is a template used to build a "proper" file containing references
+    for an SSO instance. Replace "OUTPUT_TAG" with the output string and
+    the JBOSS_CONNECTION_INFO -->
+    <profile name="OUTPUT_TAG-jmx">
+        <description>A profiler for OUTPUT_TAG to collect SSO information</description>
+        <pollInterval>60</pollInterval>
+        <provider type="jmx" name="OUTPUT_TAG">
+            JBOSS_CONNECTION_INFO
+            <metricGroup name="SsoServerAuthSvc">
+                <mbeanName>SUN_OPENSSO_SERVER_MIB_SsoServerInstance:name=com.sun.identity.monitoring.SsoServerAuthSvc</mbeanName>
+                <metric name="AuthenticationSuccessCount" />
+                <metric name="AuthenticationFailureCount" />
+                <metric name="AuthenticationSuccessRate" />
+                <metric name="AuthenticationFailureRate" />
+            </metricGroup>
+            <metricGroup name="SsoServerSessSvc">
+                <mbeanName>SUN_OPENSSO_SERVER_MIB_SsoServerInstance:name=com.sun.identity.monitoring.SsoServerSessSvc</mbeanName>
+                <metric name="SessionActiveCount" />
+                <metric name="SessionCreatedCount" />
+            </metricGroup>
+            <metricGroup name="SsoServerIdRepoSvc">
+                <mbeanName>SUN_OPENSSO_SERVER_MIB_SsoServerInstance:name=com.sun.identity.monitoring.SsoServerIdRepoSvc</mbeanName>
+                <metric name="IdRepoCacheEntries" />
+                <metric name="IdRepoCacheHits" />
+                <metric name="IdRepoGetRqts" />
+                <metric name="IdRepoSearchCacheHits" />
+                <metric name="IdRepoSearchRqts" />
+            </metricGroup>
+        </provider>
+    </profile>
+</instr>
+

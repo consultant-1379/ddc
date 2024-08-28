@@ -1,0 +1,17 @@
+#!/bin/bash -a
+
+ORB_TCP_TIMEOUT=120000
+JAVAFLAGS="-Dvbroker.orb.qos.relativeRTT=${ORB_TCP_TIMEOUT} -Dvbroker.orb.qos.connectionTimeout=10000 ${JAVAFLAGS}"
+JARS=$(/bin/ls /opt/ericsson/ERICddc/lib/*.jar | /bin/awk -F: '{ORS=":"; print}')
+if [ -d /opt/ericsson/com.ericsson.oss.nbi.fm/test_client ] ; then
+    IDL_JAR=$(find /opt/ericsson/com.ericsson.oss.nbi.fm/test_client/ -name 'corbaserver-CIRPCompiledIDL-*.jar')
+    JARS="${JARS}:${IDL_JAR}"
+fi
+JARS="${JARS}:/opt/MicroFocus/VisiBroker/lib/vbjorb.jar:/opt/MicroFocus/VisiBroker/lib/lm.jar"
+JAVAFLAGS="${JAVAFLAGS} -Dorg.omg.CORBA.ORBSingletonClass=com.inprise.vbroker.orb.ORBSingleton -Dorg.omg.CORBA.ORBClass=com.inprise.vbroker.orb.ORB"
+JAVAFLAGS="${JAVAFLAGS} -Dborland.enterprise.licenseDefaultDir=/opt/MicroFocus/VisiBroker/license"
+exec /usr/java/default/bin/java \
+     -server -Ds=notif -Xmx256m -Xms64m \
+     -Dvbroker.orb.warn=2 $JAVAFLAGS \
+     -cp ${JARS} \
+     com.ericsson.cifwk.diagmon.util.notif.Notif "$@"

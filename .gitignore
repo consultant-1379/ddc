@@ -1,0 +1,32 @@
+# Compiled source #
+*.class
+*/bin/*
+
+# Eclipse files
+.project
+.classpath
+.settings
+.metadata
+
+# Packages
+*.jar
+
+# Maven build files
+target
+reports
+
+# E2E Log created by Maven build
+e2e_plugin/e2e_plugin.log
+
+# ARQ tests
+arq-perf
+
+# PMD
+.pmd
+
+#Generated files
+*.ser
+
+# Merge files
+*.orig
+

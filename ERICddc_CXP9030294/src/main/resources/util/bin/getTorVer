@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# We need to get information on how to determine the version of TOR/LITP that is installed
+# as soon as this is available from the LITP designers [eronkeo: 06-MAR-2013]
+getTorVer() {
+    TOR_VER_NUM=0
+}
+
+
+# Only set DDCDIR if it hasn't already been set (e.g. the the global.env)
+if [ -z "${DDCDIR}" ] ; then
+    UTIL_BIN=$(dirname $0)
+    UTIL_BIN=$(cd ${UTIL_BIN} 2>/dev/null && pwd || echo ${UTIL_BIN})
+    UTIL_ROOT=$(dirname ${UTIL_BIN})
+    DDCDIR=$(dirname ${UTIL_ROOT})
+fi
+
+getTorVer
+
+# Only set OSS-specific flags on the blade running the OSS
+if [ -x /bin/rpm ] && [ $(/bin/rpm -qa | grep ERICcommon | wc -l) -ge 1 ] ; then
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.disableORB=true"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.disableCS=true"
+    JAVA_HOME=/usr/java/default
+
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.subnetlabel=${SUBNETWORK_LABEL}"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.segment=${SEGMENT}"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.common.torvernum=${TOR_VER_NUM}"
+
+    #UTIL_JAR=${UTIL_ROOT}/lib/util_tor.jar
+else
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.disableORB=true"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.disableCS=true"
+    JAVA_HOME=/usr/java/default
+
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.subnetlabel=${SUBNETWORK_LABEL}"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.segment=${SEGMENT}"
+    JAVAFLAGS="${JAVAFLAGS} -Dcom.ericsson.cifwk.diagmon.util.common.torvernum=${TOR_VER_NUM}"
+
+    #UTIL_JAR=${UTIL_ROOT}/lib/util_tor.jar
+fi
+
+#
+# Common JAR stuff
+#
+#LOG4J_JAR=${UTIL_ROOT}/lib/log4j.jar
+
+#if [ ! -z "${JAKARTA_CLI_CLASSPATH}" ] ; then
+#    CLASSPATH=${JAKARTA_CLI_CLASSPATH}:${CLASSPATH}
+#else
+#    CLASSPATH=${UTIL_ROOT}/lib/commons-cli-1.0.jar:${CLASSPATH}
+#fi
+
+
+###
+# We don't source global.env in this script any more, but still need to set these two variables
+#                                                                               [BG 2012-07-11]
+###
+OS_PLATFORM="$(uname -s)"
+OS_ARCH="$(uname -p)"
+
+LD_LIBRARY_PATH=${UTIL_ROOT}/lib/${OS_PLATFORM}/${OS_ARCH}:${LD_LIBRARY_PATH}

@@ -1,0 +1,27 @@
+#!/bin/bash -a
+#
+
+UTIL_BIN=$(dirname $0)
+source ${UTIL_BIN}/getTorVer
+
+# Add in JMX
+JAVAFLAGS="${JAVAFLAGS} -Dcom.sun.management.jmxremote"
+
+CLASSPATH=${JAVA_HOME}/lib/tools.jar:${CLASSPATH}
+
+# TDDDCDDP-11: TAF JMX Data Collection - Check if TOR Server [29-01-2013 RK]
+UTIL_JARS=$(/bin/ls /opt/ericsson/ERICddc/lib/*.jar | /bin/awk -F: '{ORS=":"; print}')
+JBOSS_CLIENT=/ericsson/3pp/jboss/bin/client/jboss-client.jar
+
+if [ -z "${E2E_HEAP_SIZE}" ] ; then
+    E2E_HEAP_SIZE=48m
+fi
+MEM_FLAGS="-Xmx${E2E_HEAP_SIZE} -Xss256k -XX:MaxDirectMemorySize=8m"
+HOSTNAME=$(hostname)
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+ERROR_FLAG="-XX:ErrorFile=/ericsson/enm/dumps/hs_err_e2e_${HOSTNAME}_${TIMESTAMP}.log"
+
+# Remove 64-bit flag for TOR servers and set path to Instr class for TOR
+CMD="${JAVA_HOME}/bin/java -server -Ds=e2e_plugin ${MEM_FLAGS} ${ERROR_FLAG} $JAVAFLAGS -cp ${UTIL_JARS}:${JBOSS_CLIENT}:$CLASSPATH com.ericsson.cifwk.diagmon.e2e.E2eDriver $*"
+
+exec ${CMD}

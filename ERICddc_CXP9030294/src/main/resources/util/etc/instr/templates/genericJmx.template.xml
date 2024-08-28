@@ -1,0 +1,109 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+  <createdBy>DDC</createdBy>
+  <!-- this is a template used to build a "proper" file containing references
+       for a generic JMX instance. Replace "OUTPUT_NAME" with the output string and
+       DDC_CONNECTION_INFO comment with the searchElement/ipService elements -->
+  <profile name="OUTPUT_NAME-jmx">
+    <description>A profiler for OUTPUT_NAME to collect generic JVM information</description>
+    <provider type="jmx" name="OUTPUT_NAME">
+      <!-- DDC_CONNECTION_INFO -->
+      <metricGroup name="jvm-memory">
+        <mbeanName>java.lang:type=Memory</mbeanName>
+        <metric name="ObjectPendingFinalizationCount" />
+        <compositeMetric name="HeapMemoryUsage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+        <compositeMetric name="NonHeapMemoryUsage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+      </metricGroup>
+      <metricGroup name="nio-memory-direct">
+        <mbeanName>java.nio:type=BufferPool,name=direct</mbeanName>
+        <metric name="Count" />
+        <metric name="MemoryUsed" />
+      </metricGroup>
+      <metricGroup name="nio-memory-mapped">
+        <mbeanName>java.nio:type=BufferPool,name=mapped</mbeanName>
+        <metric name="Count" />
+        <metric name="MemoryUsed" />
+      </metricGroup>
+      <metricGroup name="threads">
+        <mbeanName>java.lang:type=Threading</mbeanName>
+        <metric name="ThreadCount" />
+        <metric name="PeakThreadCount" />
+      </metricGroup>
+      <metricGroup name="os">
+        <mbeanName>java.lang:type=OperatingSystem</mbeanName>
+        <metric name="ProcessCpuTime" />
+        <metric name="AvailableProcessors" />
+        <metric name="ProcessCpuLoad" />
+        <metric name="OpenFileDescriptorCount" />
+      </metricGroup>
+      <metricGroup name="runtime">
+        <mbeanName>java.lang:type=Runtime</mbeanName>
+        <metric name="Uptime" />
+      </metricGroup>
+    </provider>
+    <provider type="jvmgc" name="OUTPUT_NAME">
+      <!-- DDC_CONNECTION_INFO -->
+      <metric name="young-count" />
+      <metric name="young-time" />
+      <metric name="old-count" />
+      <metric name="old-time" />
+    </provider>
+  </profile>
+
+  <profile name="OUTPUT_NAME-lr-jmx">
+    <description>A low resolution (15 mins) profiler for OUTPUT_NAME to collect generic JVM information</description>
+    <pollInterval>900</pollInterval>
+    <provider type="jmx" name="OUTPUT_NAME-lr">
+      <!-- DDC_CONNECTION_INFO -->
+      <metricGroup name="jvm-mem-codecache">
+        <mbeanName>java.lang:type=MemoryPool,name=Code Cache</mbeanName>
+        <compositeMetric name="Usage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+      </metricGroup>
+
+      <metricGroup name="jvm-compilation">
+        <mbeanName>java.lang:type=Compilation</mbeanName>
+        <metric name="TotalCompilationTime"/>
+      </metricGroup>
+
+      <!-- JAVA_8_BLOCK
+      <metricGroup name="jvm-mem-ccs">
+        <mbeanName>java.lang:type=MemoryPool,name=Compressed Class Space</mbeanName>
+        <compositeMetric name="Usage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+      </metricGroup>
+
+      <metricGroup name="jvm-mem-meta">
+        <mbeanName>java.lang:type=MemoryPool,name=Metaspace</mbeanName>
+        <compositeMetric name="Usage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+      </metricGroup>
+      JAVA_8_BLOCK -->
+
+    </provider>
+  </profile>
+
+</instr>

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.ericsson.nms</groupId>
+        <artifactId>integration</artifactId>
+        <version>15.2.0.40</version>
+    </parent>
+    <groupId>com.ericsson.cifwk.diagmon</groupId>
+    <artifactId>ddc</artifactId>
+    <version>6.16.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>${project.artifactId} Parent</name>
+
+    <properties>
+      <ericsson.scm.url>scm:git:[fetch=]ssh://gerrit-gamma-read.seli.gic.ericsson.se:29418/OSS/com.ericsson.cifwk.diagmon/ddc[push=]ssh://gerrit-gamma.gic.ericsson.se:29418/OSS/com.ericsson.cifwk.diagmon/ddc</ericsson.scm.url>
+      <sonar.jacoco.reportPaths>${project.basedir}/target/coverage.exec</sonar.jacoco.reportPaths>
+      <sonar.coverage.exclusions>e2e_test/**</sonar.coverage.exclusions>
+    </properties>
+    <description>Parent pom for the DDC project.</description>
+    <build>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.0.0-M3</version>
+        </plugin>
+      </plugins>
+    </build>
+
+    <reporting>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-report-plugin</artifactId>
+          <version>3.0.0-M3</version>
+          <configuration>
+          <aggregate>true</aggregate>
+          </configuration>
+        </plugin>
+      </plugins>
+    </reporting>
+
+    <modules>
+        <module>util_tor</module>
+        <module>e2e_plugin</module>
+	<module>e2e_test</module>
+        <module>ERICddc_CXP9030294</module>
+  </modules>
+ 
+  <scm>
+    <developerConnection>${ericsson.scm.url}</developerConnection>
+    <connection>${ericsson.scm.url}</connection>
+    <tag>HEAD</tag>
+  </scm>
+
+</project>

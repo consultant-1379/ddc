@@ -1,0 +1,14 @@
+<assembly>
+    <id>ERICddc</id>
+    <formats>
+        <format>tar.gz</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+    <fileSets>
+        <fileSet>
+            <directory>.</directory>
+            <outputDirectory>ERICddc_${ericsson.rstate}</outputDirectory>
+            <useDefaultExcludes>false</useDefaultExcludes>
+        </fileSet>
+    </fileSets>
+</assembly>

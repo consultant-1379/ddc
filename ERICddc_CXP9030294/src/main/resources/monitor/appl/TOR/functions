@@ -1,0 +1,4201 @@
+#!/bin/bash
+
+##############################################################################################
+################################# INSTRUMENTATION XML CREATION ###############################
+##############################################################################################
+
+createInstrXmls() {
+    local SERVICE_GROUP="$1"
+    local INSTR_DIR="$2"
+
+    logInfo "Start creating instr xml files, SERVICE_GROUP=\"${SERVICE_GROUP}\""
+
+    CREATE_INSTR_XML_ERROR=""
+
+    setConfigValue E2E_HEAP_SIZE
+
+    if [ "${IS_CLOUD_NATIVE}" = "yes" ] ; then
+        createInstrXmlsRemote "${SERVICE_GROUP}" "${INSTR_DIR}"
+    else
+        createInstrXmlsLocal "${SERVICE_GROUP}" "${INSTR_DIR}"
+    fi
+}
+
+# Create Instr XML files for JVMs are running locally (on same "host")
+createInstrXmlsLocal() {
+    local SERVICE_GROUP="$1"
+    local INSTR_DIR="$2"
+
+    if [ -d /ericsson/3pp/jboss/bin ] ; then
+        ${_PGREP} -f 'Djboss.node.name' > /dev/null
+        if [ $? -eq 0 ] ; then
+            setJbossEnvironment
+            setJBossJmxServiceURL
+
+            GENERIC_JBOSS_INSTANCE="jboss"
+            initJMS
+            if [ "${HAS_JMS}" = "yes" ] ; then
+                # Hack here, we need to use a "fake" JBOSS_INSTANCE so we
+                # know that this is the generic instr for the JMS server
+                GENERIC_JBOSS_INSTANCE="jms"
+            fi
+
+            local MONITORED_JVM="${GENERIC_JBOSS_INSTANCE};${JBOSS_JMX_SERVICE_URL};yes;yes;;"
+            createInstrXmlForTarget "${SERVICE_GROUP}" "${INSTR_DIR}" "${MONITORED_JVM}"
+            if [ ! -z "${CREATE_INSTR_XML_ERROR}" ] ; then
+                return
+            fi
+        fi
+    fi
+
+    if [ "${SERVICE_GROUP}" = "solr" ] ; then
+        writeGenericJmx 'solr' '.*-Dname=solr.*' "${INSTR_DIR}"
+        writeSolrInstr "${INSTR_DIR}"
+    elif [ "${SERVICE_GROUP}" = "lvsrouter" ] ; then
+        writeConnTrackInstr "${INSTR_DIR}"
+    else
+        # Get any other running JVM that has a -Ds= flag
+        # Exclude instr and JBoss from this
+        S_ID_LIST=$($_PS -e -o args | $_EGREP 'java .* -Ds=' | $_EGREP -v $_EGREP | $_SED 's/.* -Ds=//' | $_SED 's/ .*//' | $_EGREP -vw 'instr|jmsclient|notif' | $_GREP -v 'Djboss.node.name')
+        for S_ID in ${S_ID_LIST} ; do
+            writeGenericJmx "${S_ID}" ".* -Ds=${S_ID} .*" "${INSTR_DIR}"
+            case "${S_ID}" in
+                kafka*)
+                    writeKafkaInstr "${INSTR_DIR}" ${S_ID}
+                    ;;
+                asr*-driver)
+                    TYPE=$($_ECHO "${S_ID}" | $_SED 's/-driver$//')
+                    writeAsrDriverInstr "${INSTR_DIR}" "${TYPE}"
+                    # writeAsrDriverInstr will set the ASR_DIR
+                    # record the fact that the driver is running on this host
+                    ${_ECHO} ${HOSTNAME} > ${ASR_DIR}/driver_host
+                    ;;
+                *)
+                    ${UTILDIR}/bin/e2eXMLGenerator --metricsdir ${INSTR_DIR} \
+                                --config ${TOR_MONITORDIR}/e2e.properties \
+                                --mbeansdir ${DATAROOT}/${DATE}/TOR/e2e_mbeans \
+                                --jvmname ${S_ID}
+                    if [ $? -ne 0 ] ; then
+                        CREATE_INSTR_XML_ERROR="E2E Failed for ${S_ID}"
+                        return
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    writeElasticsearchJmx ${INSTR_DIR}
+    writeEShistoryJmx ${INSTR_DIR}
+}
+
+# Create Instr XML files for JVMs are running remote (e.g. in another container)
+createInstrXmlsRemote() {
+    local SERVICE_GROUP="$1"
+    local INSTR_DIR="$2"
+
+    initMonitoredJvmList
+    for MONITORED_JVM in ${MONITORED_JVM_LIST} ; do
+        createInstrXmlForTarget "${SERVICE_GROUP}" "${INSTR_DIR}" "${MONITORED_JVM}"
+    done
+}
+
+# Generate generic JMX instr XML and optionally e2e derived instr XMLs
+# for one monitored JVM
+createInstrXmlForTarget() {
+    local SERVICE_GROUP="$1"
+    local INSTR_DIR="$2"
+    local MONITORED_JVM="$3"
+
+    local JVM_NAME=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $1}')
+    local JMX_SERVICE_URL=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $2}')
+    local E2E=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $3}')
+    local REQUIRE_DISPLAYNAME=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $4}')
+    local USERNAME=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $5}')
+    local PASSWORD=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $6}')
+
+    local CREDS=""
+    if [ -n "${USERNAME}" ] ; then
+        CREDS=" creds=\"${USERNAME}:${PASSWORD}\""
+    fi
+    local CONNECTION_INFO="<ipService jmxurl=\"${JMX_SERVICE_URL}\"${CREDS}/>"
+    _writeGenericJmx "${JVM_NAME}" "${CONNECTION_INFO}" ${INSTR_DIR}/genjmx_${JVM_NAME}.xml
+
+    if [ "${E2E}" = "yes" ] ; then
+        # WA for TORF-537162
+        if [ "${SERVICE_GROUP}" = "importexportservice" ] ; then
+            logWarning "E2E disabled for service group ${SERVICE_GROUP}"
+            return
+        fi
+
+        local SECURE_JVM_SERVICE_URL=$(getSecureJmxUrl "${MONITORED_JVM}")
+        e2eInstr "${INSTR_DIR}" "${JVM_NAME}" "${SECURE_JVM_SERVICE_URL}" "${REQUIRE_DISPLAYNAME}"
+
+        # For any jboss instance, the JVM_NAME must start with jboss
+        # or = jms
+        if [[ "${JVM_NAME}" =~ ^jboss ]] || [ "${JVM_NAME}" = "jms" ] ; then
+            JBOSS_CONNECTION_INFO="${CONNECTION_INFO}"
+            writeJBossInstr "${SERVICE_GROUP}" "${INSTR_DIR}" "${JVM_NAME}"
+        fi
+    fi
+}
+
+# Build the list of monitored JVMs
+#
+# If DDC_JVM_LIST is set - then use that as the input list
+#  DDC_JVM_LIST is a a space seperated list of JVMs to monitor
+#  where each entry is a string in the strucutre
+#   jvmname;jxm_service_url;e2e;displayname;secret
+#    - jvmname: logical name of the JVM, e.g. jboss
+#    - jvmx_service_url: the URL to connect to the JVM over JMX
+#    - e2e: yes/no Use e2e to get a list of MBeans from the JVM
+#    - displayname: yes/no Require MBean to have the DisplayName attribute
+#    - secret: Optional name of secret containing username/password to use for
+#              JVM connection. Leave blank if no secret required.
+#              If secret name provided, username/password will be loaded from
+#               /run/secrets/<secret>/username
+#               /run/secrets/<secret>/username
+#              If the jvmname starts jboss or is jms,
+#              then the username/password will be loaded from
+#               /run/secrets/<secret>/jboss-user
+#               /run/secrets/<secret>/jboss-password
+#
+# Example: Here we have two JVMs, JBoss and an JSE. Neither JVM uses a secret.
+#  DDC_JVM_LIST="jboss;service:jmx:remote+http://127.0.0.1:9990;yes;yes; jse;service:jmx:rmi:///jndi/rmi://127.0.0.1:9999/jmxrmi;yes;no;"
+#
+# Otherwise we use the depreciated mechanisms
+# - If E2E_JVM_ID & JMX_SERVICE_URL set, use e2e but don't require displayname
+# - If JMX_SERVICE_URL & SERVICE_GROUP
+#      If and jboss dir exists - then use e2e with display name required
+#      else don't use e2e
+initMonitoredJvmList() {
+    if [ -n "${MONITORED_JVM_LIST}" ] ; then
+        return
+    fi
+    MONITORED_JVM_LIST=""
+    #MONITORED_JVM_LIST=jvmname;jxm_service_url;e2e;displayname;user;password
+    # If we don't have DDC_JVM_LIST, then "migrate" the old mechanisms
+    if [ -z "${DDC_JVM_LIST}" ] ; then
+        if [ -n "${E2E_JVM_ID}" ] && [ -n "${JMX_SERVICE_URL}" ] ; then
+            # EBS In cloud
+            MONITORED_JVM_LIST="${E2E_JVM_ID};${JMX_SERVICE_URL};yes;no;"
+        elif [ ! -z "${JMX_SERVICE_URL}" ] && [ ! -z "${SERVICE_GROUP}" ] ; then
+            if [ -d /ericsson/3pp/jboss/bin ] ; then
+                setJbossEnvironment
+
+                GENERIC_JBOSS_INSTANCE="jboss"
+                initJMS
+                if [ "${HAS_JMS}" = "yes" ] ; then
+                    # Hack here, we need to use a "fake" JBOSS_INSTANCE so we
+                    # know that this is the generic instr for the JMS server
+                    GENERIC_JBOSS_INSTANCE="jms"
+                fi
+
+                local JBOSS_USER=""
+                local JBOSS_PASSWORD=""
+                if [ -r /run/secrets/jboss-creds/jboss-user ] ; then
+                    JBOSS_USER=$($_CAT /run/secrets/jboss-creds/jboss-user)
+                    JBOSS_PASSWORD=$($_CAT /run/secrets/jboss-creds/jboss-password)
+                fi
+                MONITORED_JVM_LIST="${GENERIC_JBOSS_INSTANCE};${JMX_SERVICE_URL};yes;yes;$JBOSS_USER;$JBOSS_PASSWORD"
+            else
+                # Other
+                MONITORED_JVM_LIST="${SERVICE_GROUP};${JMX_SERVICE_URL};no;no;;;"
+            fi
+        fi
+    else
+        for ONE in ${DDC_JVM_LIST} ; do
+            local MONITORED_JVM=$(${_ECHO} ${ONE} | ${_AWK} -F\; '{printf("%s;%s;%s;%s", $1, $2, $3, $4)}')
+            local JVM_NAME=$(${_ECHO} ${ONE} | ${_AWK} -F\; '{print $1}')
+            local SECRET=$(${_ECHO} ${ONE} | ${_AWK} -F\; '{print $5}')
+            if [ -n "${SECRET}" ] ; then
+                # JBoss secret doesn't conform to normal structure for secret
+                if [[ "${JVM_NAME}" =~ ^jboss ]] || [ "${JVM_NAME}" = "jms" ] ; then
+                    local USERNAME=$($_CAT /run/secrets/${SECRET}/jboss-user)
+                    local PASSWORD=$($_CAT /run/secrets/${SECRET}/jboss-password)
+                else
+                    local USERNAME=$($_CAT /run/secrets/${SECRET}/username)
+                    local PASSWORD=$($_CAT /run/secrets/${SECRET}/password)
+                fi
+                MONITORED_JVM="${MONITORED_JVM};${USERNAME};$PASSWORD"
+            else
+                MONITORED_JVM="${MONITORED_JVM};;"
+            fi
+            MONITORED_JVM_LIST="${MONITORED_JVM_LIST} ${MONITORED_JVM}"
+        done
+    fi
+}
+
+# Run e2e generating the e2e instr XML file and the MBean list file.
+e2eInstr() {
+    local INSTR_DIR="$1"
+    local JVM_NAME="$2"
+    local JVM_SERVICE_URL="$3"
+    local REQUIRE_DISPLAYNAME="$4"
+
+    local DISPLAYNAME_ARG=""
+    if [ "${REQUIRE_DISPLAYNAME}" = "yes" ] ; then
+        DISPLAYNAME_ARG="--displayname"
+    fi
+    local E2E_MBEANS_DIR=$($_DIRNAME ${INSTR_DIR})
+    E2E_MBEANS_DIR="${E2E_MBEANS_DIR}/TOR/e2e_mbeans"
+    if [ -d ${E2E_MBEANS_DIR} ] ; then
+        ${_RM} -rf ${E2E_MBEANS_DIR}
+    fi
+    ${_MKDIR} -p ${E2E_MBEANS_DIR}
+    ${UTILDIR}/bin/e2eXMLGenerator --metricsdir ${INSTR_DIR} \
+              --config ${TOR_MONITORDIR}/e2e.properties \
+              --mbeansdir ${E2E_MBEANS_DIR} \
+              --jvmname ${JVM_NAME} \
+              --jmxurl "${JVM_SERVICE_URL}" \
+              ${DISPLAYNAME_ARG}
+    if [ $? -ne 0 ] ; then
+        CREATE_INSTR_XML_ERROR="E2E Failed for JBoss"
+        return
+    fi
+
+    # Set MBEANS_FILE here, its used in other functions so it's not local
+    MBEANS_FILE=${E2E_MBEANS_DIR}/e2e_${JVM_NAME}.mbeans
+}
+
+# Loop until we can successfully "ping" all the monitored JVMs
+waitMonitoredJvmsReady() {
+    initMonitoredJvmList
+    # Loop until the JMX_SERVICE_URL becomes available
+    local TARGETS_READY=0
+    while [ ${TARGETS_READY} -eq 0 ] ; do
+        TARGETS_READY=1
+        for MONITORED_JVM in ${MONITORED_JVM_LIST} ; do
+            local JVM_NAME=$(${_ECHO} "${MONITORED_JVM}" | ${_AWK} -F\; '{print $1}')
+            local SECURE_JVM_SERVICE_URL=$(getSecureJmxUrl "${MONITORED_JVM}")
+            ${UTILDIR}/bin/e2eXMLGenerator --jmxurl "${SECURE_JVM_SERVICE_URL}" --jvmname "${JVM_NAME}" --ping
+            if [ $? -eq 0 ] ; then
+                logDebug "${JVM_NAME} ready"
+            else
+                logDebug "${JVM_NAME} not ready"
+                TARGETS_READY=0
+            fi
+        done
+
+        if [ ${TARGETS_READY} -eq 0 ] ; then
+            ${_SLEEP} 5
+        fi
+    done
+}
+
+# Use the MBeans file to "discover" what other MBeans we should be monitoring
+# from JBoss
+writeJBossInstr() {
+    local SERVICE_GROUP="$1"
+    local INSTR_DIR="$2"
+    local JVM_NAME="$3"
+
+    writeJbossThreadPool "${JVM_NAME}" "${INSTR_DIR}"
+    writeJbossWebConnector "${JVM_NAME}" "${INSTR_DIR}"
+    writeJBossDataSourcePool "${JVM_NAME}" "${INSTR_DIR}"
+
+    if [ "${SERVICE_GROUP}" == "mspm" ] ; then
+        writePoolInstr "${INSTR_DIR}"
+    elif [ "${SERVICE_GROUP}" == "sso" ] ; then
+        writeSSO "${JVM_NAME}" "${INSTR_DIR}"
+    fi
+
+    writeJmsDestinations "jboss" "${INSTR_DIR}" "${SERVICE_GROUP}" "Queue" ${MBEANS_FILE}
+    writeJmsDestinations "jboss" "${INSTR_DIR}" "${SERVICE_GROUP}" "Topic" ${MBEANS_FILE}
+
+    writeRoutesInstr "${INSTR_DIR}"
+    writeCacheInstr "${INSTR_DIR}"
+    writeStreamingInstrXml "${INSTR_DIR}"
+}
+
+getSecureJmxUrl() {
+    local MONITORED_JVM="$1"
+
+    local JMX_SERVICE_URL=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $2}')
+    local USERNAME=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $5}')
+    local PASSWORD=$(${_ECHO} ${MONITORED_JVM} | ${_AWK} -F\; '{print $6}')
+
+    if [ -z "${USERNAME}" ] ; then
+        ${_ECHO} "${JMX_SERVICE_URL}"
+    else
+        local ENCRYPT_USER=$(echo -n ${USERNAME} | base64)
+        local ENCRYPT_PSWD=$(echo -n ${PASSWORD} | base64)
+        ${_ECHO} "${ENCRYPT_USER}:${ENCRYPT_PSWD}@${JMX_SERVICE_URL}"
+    fi
+}
+
+writeGenericJmx() {
+    local OUTPUT_NAME=$1
+    local SEARCH_STRING=$2
+    local INSTR_XML_DIR=$3
+
+    local CONNECTION_INFO="<searchString>${SEARCH_STRING}</searchString>"
+
+    _writeGenericJmx $OUTPUT_NAME "${CONNECTION_INFO}" ${INSTR_XML_DIR}/genjmx_${OUTPUT_NAME}.xml
+}
+
+_writeGenericJmx() {
+    local OUTPUT_NAME=$1
+    local CONNECTION_INFO="$2"
+    local OUTPUT_FILE=$3
+
+    if [ -x /usr/java/default/bin/jstack ] ; then
+        local READ_FILE="${_CAT} ${DDCDIR}/util/etc/instr/templates/genericJmx.template.xml"
+    else
+        local READ_FILE="${_GREP} -vw JAVA_8_BLOCK ${DDCDIR}/util/etc/instr/templates/genericJmx.template.xml"
+    fi
+
+    ${READ_FILE} | $_SED -e "s|<!-- DDC_CONNECTION_INFO -->|${CONNECTION_INFO}|" \
+                         -e "s/OUTPUT_NAME/${OUTPUT_NAME}/" > ${OUTPUT_FILE}
+}
+
+writeJbossThreadPool() {
+    local OUTPUT_NAME=$1
+    local INSTR_XML_DIR=$2
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    logDebug "JBOSS Thread Pool XML Generation: ${OUTPUT_NAME}"
+
+    local INSTR_FILE=${INSTR_XML_DIR}/threadpooljmx_${OUTPUT_NAME}.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writeJbossThreadPool</createdBy>
+    <profile name="${OUTPUT_NAME}-jmx">
+        <description>A profiler to collect JBoss Thread pool information</description>
+        <pollInterval>300</pollInterval>
+        <provider type="jmx" name="${OUTPUT_NAME}-threadpool">
+           ${JBOSS_CONNECTION_INFO}
+EOF
+
+    local THREADS_TP_LIST=$($_EGREP '^jboss.as.expr:.*-thread-pool=.*,subsystem=threads$' ${MBEANS_FILE} | $_SED 's/^jboss.as.expr://' | $_AWK -F, '{print $1}')
+    for THREADS_TP in ${THREADS_TP_LIST} ; do
+        TYPE=$($_ECHO ${THREADS_TP} | $_AWK -F= '{print $1}')
+        NAME=$($_ECHO ${THREADS_TP} | $_AWK -F= '{print $2}')
+         cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${NAME}">
+               <mbeanName>jboss.as.expr:subsystem=threads,${TYPE}=${NAME}</mbeanName>
+               <metric name="queueLength" />
+               <metric name="currentThreadCount" />
+               <metric name="largestThreadCount" />
+               <metric name="queueSize" />
+               <metric name="rejectedCount" />
+            </metricGroup>
+EOF
+    done
+
+
+    local EJB3_TP_LIST=$($_EGREP '^jboss.as:subsystem=ejb3,thread-pool=.*$' ${MBEANS_FILE}  | $_AWK -F= '{print $NF}')
+    for EJB3_TP in ${EJB3_TP_LIST} ; do
+        cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${EJB3_TP}">
+                <mbeanName>jboss.as:subsystem=ejb3,thread-pool=${EJB3_TP}</mbeanName>
+                <metric name="activeCount" />
+                <metric name="completedTaskCount" />
+                <metric name="currentThreadCount" />
+                <metric name="largestThreadCount" />
+                <metric name="queueSize" />
+                <metric name="rejectedCount" />
+                <metric name="taskCount" />
+            </metricGroup>
+EOF
+    done
+
+    local EAP7_TP_LIST=$($_EGREP '^jboss.as:subsystem=io,worker=.*$' ${MBEANS_FILE}  | $_AWK -F= '{print $NF}')
+    for EAP7_TP in ${EAP7_TP_LIST} ; do
+        cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="io-${EAP7_TP}">
+                <mbeanName>jboss.as:subsystem=io,worker=${EAP7_TP}</mbeanName>
+                <metric name="queue-size" />
+                <metric name="io-thread-count" />
+                <metric name="busy-task-thread-count" />
+            </metricGroup>
+EOF
+    done
+
+    local JCA_TP_LIST=$($_EGREP '^jboss.as:.*threads=default,subsystem=jca,workmanager=default$' ${MBEANS_FILE}  | $_SED 's/^jboss.as://' | $_AWK -F\- '{print $1}')
+    for JCA_TP in ${JCA_TP_LIST} ; do
+        cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="workmanager-${JCA_TP}">
+               <mbeanName>jboss.as:subsystem=jca,workmanager=default,${JCA_TP}-running-threads=default</mbeanName>
+               <metric name="queueLength" />
+               <metric name="currentThreadCount" />
+               <metric name="largestThreadCount" />
+               <metric name="queueSize" />
+               <metric name="rejectedCount" />
+            </metricGroup>
+EOF
+    done
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+writeJbossWebConnector() {
+    local OUTPUT_NAME=$1
+    local INSTR_XML_DIR=$2
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    local CONNECTOR_LIST=$($_EGREP '^jboss.as.expr:connector=.*,subsystem=web$' ${MBEANS_FILE} | $_SED -e 's/^jboss.as.expr:connector=//' -e 's/,subsystem=web$//')
+    if [ -z "${CONNECTOR_LIST}" ] ; then
+        return
+    fi
+
+    logDebug "JBOSS Web Connector_Bean XML Generation: ${OUTPUT_NAME}"
+
+    local INSTR_FILE=${INSTR_XML_DIR}/webconnector_${OUTPUT_NAME}.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writeJbossWebConnector</createdBy>
+    <profile name="${OUTPUT_NAME}-webconnector">
+        <description>A profiler to collect JBoss Web Connector information</description>
+        <pollInterval>300</pollInterval>
+        <provider type="jmx" name="webconnector">
+           ${JBOSS_CONNECTION_INFO}
+EOF
+
+    for CONNECTOR in ${CONNECTOR_LIST} ; do
+         cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${CONNECTOR}">
+               <mbeanName>jboss.as.expr:connector=${CONNECTOR},subsystem=web</mbeanName>
+               <metric name="bytesReceived" />
+               <metric name="bytesSent" />
+               <metric name="errorCount" />
+               <metric name="processingTime" />
+               <metric name="requestCount" />
+            </metricGroup>
+EOF
+    done
+
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+writeJBossDataSourcePool() {
+    local OUTPUT_NAME=$1
+    local INSTR_XML_DIR=$2
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    local POOL_LIST=$($_EGREP '^jboss.as:data-source=.*,statistics=pool,subsystem=datasources$' ${MBEANS_FILE} | $_SED -e 's/^jboss.as:data-source=//' -e 's/,statistics=pool,subsystem=datasources$//')
+    if [ -z "${POOL_LIST}" ] ; then
+        return
+    fi
+
+    logDebug "JBOSS datasourcepool XML Generation: ${OUTPUT_NAME}"
+
+    local INSTR_FILE=${INSTR_XML_DIR}/datasourcepool_${OUTPUT_NAME}.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writeJBossDataSourcePool</createdBy>
+    <profile name="${OUTPUT_NAME}-datasourcepool">
+        <description>A profiler to collect JBoss datasource pool information</description>
+        <pollInterval>60</pollInterval>
+        <provider type="jmx" name="datasource">
+           ${JBOSS_CONNECTION_INFO}
+EOF
+
+    for POOL in ${POOL_LIST} ; do
+         cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${POOL}">
+               <mbeanName>jboss.as:data-source=${POOL},statistics=pool,subsystem=datasources</mbeanName>
+               <metric name="ActiveCount"/>
+               <metric name="AvailableCount"/>
+               <metric name="AverageBlockingTime"/>
+               <metric name="AverageCreationTime"/>
+               <metric name="AverageGetTime"/>
+               <metric name="AveragePoolTime"/>
+               <metric name="AverageUsageTime"/>
+               <metric name="BlockingFailureCount"/>
+               <metric name="CreatedCount"/>
+               <metric name="DestroyedCount"/>
+               <metric name="IdleCount"/>
+               <metric name="InUseCount"/>
+               <metric name="MaxCreationTime"/>
+               <metric name="MaxGetTime"/>
+               <metric name="MaxPoolTime"/>
+               <metric name="MaxUsageTime"/>
+               <metric name="MaxUsedCount"/>
+               <metric name="MaxWaitCount"/>
+               <metric name="MaxWaitTime"/>
+               <metric name="TimedOut"/>
+               <metric name="TotalBlockingTime"/>
+               <metric name="TotalCreationTime"/>
+               <metric name="TotalGetTime"/>
+               <metric name="TotalPoolTime"/>
+               <metric name="TotalUsageTime"/>
+               <metric name="WaitCount"/>
+            </metricGroup>
+EOF
+    done
+
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+writeSSO() {
+    local OUTPUT_NAME=$1
+    local INSTR_XML_DIR=$2
+
+    logInfo "SSO XML Generation: ${OUTPUT_NAME}"
+
+    $_SED -e "s/OUTPUT_TAG/${OUTPUT_NAME}/" -e "s|JBOSS_CONNECTION_INFO|${JBOSS_CONNECTION_INFO}|" \
+        ${DDCDIR}/util/etc/instr/templates/sso.template.xml > ${INSTR_XML_DIR}/3pp_${OUTPUT_NAME}.xml
+}
+
+
+writeRoutesInstr() {
+    local INSTR_XML_DIR=$1
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    local ROUTE_BEAN_LIST=$($_EGREP '^org.apache.camel:.*,type=routes$' ${MBEANS_FILE})
+    if [ -z "${ROUTE_BEAN_LIST}" ] ; then
+        return
+    fi
+
+    local INSTR_FILE=${INSTR_XML_DIR}/routes.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writePmRoutesInstr</createdBy>
+    <profile name="routes">
+        <description>A profiler for information about Camel routes</description>
+        <provider type="jmx" name="routes">
+        ${JBOSS_CONNECTION_INFO}
+EOF
+    for ROUTE_BEAN in ${ROUTE_BEAN_LIST} ; do
+        ROUTE_NAME=$(echo "${ROUTE_BEAN}" | sed 's/.*name="//' | sed 's/",type=routes$//' | sed 's/direct://')
+        $_CAT >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${ROUTE_NAME}">
+                <mbeanName>${ROUTE_BEAN}</mbeanName>
+                <metric name="ExchangesTotal" />
+                <metric name="ExchangesCompleted" />
+                <metric name="ExchangesFailed" />
+                <metric name="InflightExchanges" />
+                <metric name="TotalProcessingTime"/>
+            </metricGroup>
+EOF
+    done
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+writeCacheInstr() {
+    local INSTR_XML_DIR=$1
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    local STATS_BEAN_LIST=$($_EGREP '^com.ericsson.oss.itpf.sdk.cache.infinispan.*:component=Statistics' ${MBEANS_FILE})
+    if [ -z "${STATS_BEAN_LIST}" ] ; then
+        return
+    fi
+
+    local INSTR_FILE=${INSTR_XML_DIR}/cache.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writeCacheInstr</createdBy>
+    <profile name="cache">
+        <description></description>
+        <pollInterval>900</pollInterval>
+        <provider type="jmx" name="cache">
+        ${JBOSS_CONNECTION_INFO}
+EOF
+
+    for STATS_BEAN in ${STATS_BEAN_LIST} ; do
+        local CACHE_NAME_TYPE=$(echo "${STATS_BEAN}" | $_SED 's/.*,name="//' | $_SED 's/".*//')
+        local CACHE_NAME=$(echo "${CACHE_NAME_TYPE}" | $_SED 's/(.*//')
+        local CACHE_TYPE=$(echo "${CACHE_NAME_TYPE}" | $_SED 's/.*(//' | $_SED 's/)$//')
+        $_CAT >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${CACHE_NAME}-stats">
+                <mbeanName>${STATS_BEAN}</mbeanName>
+                <metric name="averageRemoveTime" />
+                <metric name="averageWriteTime" />
+                <metric name="evictions" />
+                <metric name="hits" />
+                <metric name="misses" />
+                <metric name="numberOfEntries"/>
+                <metric name="removeHits"/>
+                <metric name="removeMisses"/>
+                <metric name="stores"/>
+            </metricGroup>
+EOF
+
+        if [ "${CACHE_TYPE}" != "local" ] ; then
+            local RPC_BEAN=$(echo "${STATS_BEAN}" | $_SED 's/:component=Statistics,/:component=RpcManager,/')
+            local CHANNEL_BEAN="com.ericsson.oss.itpf.sdk.cache.infinispan:type=channel,cluster=\"${CACHE_NAME}\""
+            $_CAT >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${CACHE_NAME}-rpc">
+                <mbeanName>${RPC_BEAN}</mbeanName>
+                <metric name="averageReplicationTime" />
+                <metric name="replicationCount" />
+                <metric name="replicationFailures" />
+            </metricGroup>
+            <metricGroup name="${CACHE_NAME}-channel">
+                <mbeanName>${CHANNEL_BEAN}</mbeanName>
+                <metric name="received_bytes" />
+                <metric name="received_messages" />
+                <metric name="sent_bytes" />
+                <metric name="sent_messages" />
+            </metricGroup>
+EOF
+
+    fi
+    done
+
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+
+}
+
+writePoolInstr() {
+    local INSTR_XML_DIR=$1
+
+    if [ ! -r ${MBEANS_FILE} ] ; then
+        return
+    fi
+
+    local POOL_BEAN_LIST=$($_EGREP '^org.apache.commons.pool2:.*,type=GenericKeyedObjectPool$' ${MBEANS_FILE})
+    if [ -z "${POOL_BEAN_LIST}" ] ; then
+        return
+    fi
+
+    local INSTR_FILE=${INSTR_XML_DIR}/pools.xml
+    $_CAT > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>DDC writePoolInstr</createdBy>
+    <profile name="pools">
+        <description>A profiler for information about Apache GenericKeyedObjectPools</description>
+        <provider type="jmx" name="pools">
+        ${JBOSS_CONNECTION_INFO}
+EOF
+    for POOL_BEAN in ${POOL_BEAN_LIST} ; do
+        POOL_NAME=$(echo "${POOL_BEAN}" | sed 's/.*name=//' | sed 's/,type=GenericKeyedObjectPool$//')
+        $_CAT >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${POOL_NAME}">
+                <mbeanName>${POOL_BEAN}</mbeanName>
+                <metric name="BorrowedCount" />
+                <metric name="CreatedCount" />
+                <metric name="DestroyedByEvictorCount" />
+                <metric name="DestroyedCount" />
+                <metric name="NumActive"/>
+                <metric name="NumIdle"/>
+                <metric name="ReturnedCount"/>
+            </metricGroup>
+EOF
+    done
+    $_CAT >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+
+# Generate Streaming xml for collection of Streaming metrics
+writeStreamingInstrXml() {
+    local INSTR_XML_DIR=$1
+
+    StreamingString="Dcom.ericsson.oss.mediation.streaming."
+    # Check if Streaming is running
+    StreamingOnline=$($_PS -ef | $_GREP ${StreamingString} | $_GREP -v grep | $_WC -l)
+    if [ $StreamingOnline -eq 0 ]; then
+        logDebug "No Streaming running"
+    else
+        # Create Directory if it doesn't exit
+        [ ! -d ${INSTR_XML_DIR} ] && $_MKDIR ${INSTR_XML_DIR}
+
+        # Create Streaming xml file
+        logDebug "Creating Streaming xml"
+        Name="STREAMING"
+        # Define generic XML file name and xml search string
+        JBFILE=${INSTR_XML_DIR}/app_${Name}.xml
+        StreamingXMLString=".*-${StreamingString}*"
+
+        $_CAT << EOF > ${JBFILE}
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Ciaran Johnston</createdBy>
+    <!-- this is a template used to build a "proper" file containing references
+    for a generic JMX instance. Replace "COSM" with the output string and
+    ".*-Ds=COSMMCServer.*" with the search string. -->
+    <profile name="COSM-jmx">
+        <description>A profiler for COSM to collect generic JVM information</description>
+        <provider type="jmx" name="${Name}">
+            <searchString>${StreamingXMLString}</searchString>
+            <metricGroup name="jvm-memory">
+                <mbeanName>java.lang:type=Memory</mbeanName>
+                <metric name="ObjectPendingFinalizationCount" />
+                <compositeMetric name="HeapMemoryUsage">
+                    <metric name="committed" />
+                    <metric name="init" />
+                    <metric name="max" />
+                    <metric name="used" />
+                </compositeMetric>
+                <compositeMetric name="NonHeapMemoryUsage">
+                    <metric name="committed" />
+                    <metric name="init" />
+                    <metric name="max" />
+                    <metric name="used" />
+                </compositeMetric>
+            </metricGroup>
+            <metricGroup name="threads">
+                <mbeanName>java.lang:type=Threading</mbeanName>
+                <metric name="ThreadCount" />
+                <metric name="DaemonThreadCount" />
+                <metric name="PeakThreadCount" />
+            </metricGroup>
+            <metricGroup name="os">
+                <mbeanName>java.lang:type=OperatingSystem</mbeanName>
+                <metric name="ProcessCpuTime" />
+                <metric name="AvailableProcessors" />
+                <metric name="ProcessCpuLoad" />
+                <metric name="OpenFileDescriptorCount" />
+            </metricGroup>
+            <metricGroup name="runtime">
+                <mbeanName>java.lang:type=Runtime</mbeanName>
+                <metric name="Uptime" />
+            </metricGroup>
+        </provider>
+   </profile>
+</instr>
+EOF
+    fi
+}
+
+writeJmsDestinations() {
+    local JBossNAME=$1
+    local INSTR_XML_DIR=$2
+    local SERVICE_GROUP=$3
+    local DEST_TYPE=$4
+    local MBEANS_FILE=$5
+
+    initJMS
+    if [ "${HAS_JMS}" != "yes" ] ; then
+        return
+    fi
+
+    local DEST_TYPE_LC=$($_ECHO "${DEST_TYPE}" | $_TR "[:upper:]" "[:lower:]")
+    local DEST_TYPE_UC=$($_ECHO "${DEST_TYPE}" | $_TR "[:lower:]" "[:upper:]")
+
+    if [ ${EAP_VERSION} -eq 7 ] ; then
+        local MBEAN_PREFIX="jboss.as:subsystem=messaging-activemq,server=default"
+        local MBEAN_FILTER="jboss.as:jms-${DEST_TYPE_LC}="
+    else
+        local MBEAN_PREFIX="jboss.as:subsystem=messaging,hornetq-server=default"
+        local MBEAN_FILTER="jboss.as:hornetq-server=default,jms-${DEST_TYPE_LC}="
+    fi
+
+    logInfo "JBOSS JMS ${DEST_TYPE} XML Generation: ${JBossNAME}"
+    if [ -d /ericsson/jms/data ] ; then
+        # If we running co-located with the JMS server then get the
+        # list of topics/queues from the
+        local DEST_LIST=$($_GREP -i "jms-${DEST_TYPE_LC} name" ${STANDALONE_XML} | $_CUT -d"\"" -f2)
+    elif [ -s ${MBEANS_FILE} ] ; then
+        local DEST_LIST=$($_EGREP "^${MBEAN_FILTER}" ${MBEANS_FILE} | $_SED -s -e "s/${MBEAN_FILTER}//" -e 's/,.*//')
+    fi
+    if [ -z "${DEST_LIST}" ] ; then
+        logInfo "JMS ${DEST_TYPE} not found for instance :: $JBossNAME"
+        return
+    fi
+
+    local INSTR_FILE=${INSTR_XML_DIR}/jms${DEST_TYPE_LC}jmx_${JBossNAME}.xml
+
+    local POLL_INTERNAL=300
+    if [ "${DEST_TYPE}" = "Queue" ] ; then
+        POLL_INTERNAL=60
+    fi
+
+    cat > ${INSTR_FILE} <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>writeJbossJmsDestinations</createdBy>
+    <profile name="$JBossNAME-JMS-${DEST_TYPE_UC}">
+        <description>A profiler for information of JMS ${DEST_TYPE}</description>
+        <pollInterval>${POLL_INTERNAL}</pollInterval>
+        <provider type="jmx" name="$JBossNAME-Jms${DEST_TYPE}">
+            ${JBOSS_CONNECTION_INFO}
+EOF
+
+    for DEST in ${DEST_LIST} ; do
+        cat >> ${INSTR_FILE} <<EOF
+            <metricGroup name="${DEST}">
+                <mbeanName>${MBEAN_PREFIX},jms-${DEST_TYPE_LC}=${DEST}</mbeanName>
+EOF
+        if [ "${DEST_TYPE}" = "Queue" ] ; then
+            cat >> ${INSTR_FILE} <<EOF
+                <metric name="consumerCount" />
+                <metric name="deliveringCount" />
+                <metric name="messageCount" />
+                <metric name="messagesAdded" />
+                <metric name="scheduledCount" />
+            </metricGroup>
+EOF
+        else
+            cat >> ${INSTR_FILE} <<EOF
+                 <metric name="subscriptionCount" />
+                 <metric name="deliveringCount" />
+                 <metric name="messageCount" />
+                 <metric name="messagesAdded" />
+            </metricGroup>
+EOF
+        fi
+    done
+
+    cat >> ${INSTR_FILE} <<EOF
+        </provider>
+    </profile>
+</instr>
+EOF
+
+}
+
+writeKafkaInstr() {
+    local INSTR_XML_DIR=$1
+    local MATCH_STRING="$2"
+
+    local KAFKA_VERSION=$(${_LS} /ericsson/kafka | ${_GREP} -i kafka)
+    local KAFKA_DIRECTORY=/ericsson/kafka/${KAFKA_VERSION}
+    local KAFKA_CONFIG=${KAFKA_DIRECTORY}/config/server.properties
+    local ZOOKEEPER_CONNECT=$(${_CAT} ${KAFKA_CONFIG} | ${_AWK} -F'=' '{if ( $1 ~ /^zookeeper.connect$/ ) {print $2}}')
+
+    local TOPIC_LIST=""
+
+    if [ $KAFKA_VERSION == 'kafka_2.12-3.2.3' ] ; then
+        local RACK_IP=$(hostname -i)
+        TOPIC_LIST=$(${KAFKA_DIRECTORY}/bin/kafka-topics.sh --bootstrap-server ${RACK_IP}:9092 --list | egrep -v '^_')
+    else
+        TOPIC_LIST=$(${KAFKA_DIRECTORY}/bin/kafka-topics.sh --list --zookeeper ${ZOOKEEPER_CONNECT} | ${_EGREP} -v '^_')
+    fi
+    logDebug "writeKafkaInstr: TOPIC_LIST=${TOPIC_LIST}"
+
+    cat > ${INSTR_XML_DIR}/kafka.xml <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+  <createdBy>writeKafkaInstr</createdBy>
+  <profile name="kafka">
+    <description>A profiler for the kafka</description>
+    <pollInterval>60</pollInterval>
+    <provider type="jmx" name="kafka">
+     <searchString>.*-Ds=${MATCH_STRING}.*</searchString>
+
+      <metricGroup name="srv-RequestHandlerAvgIdlePercent">
+       <mbeanName>kafka.server:name=RequestHandlerAvgIdlePercent,type=KafkaRequestHandlerPool</mbeanName>
+        <metric name="Count" />
+      </metricGroup>
+      <metricGroup name="srv-NetworkProcessorAvgIdlePercent">
+       <mbeanName>kafka.network:name=NetworkProcessorAvgIdlePercent,type=SocketServer</mbeanName>
+        <metric name="Value" />
+      </metricGroup>
+      <metricGroup name="srv-MessagesInPerSec">
+       <mbeanName>kafka.server:name=MessagesInPerSec,type=BrokerTopicMetrics</mbeanName>
+        <metric name="Count" />
+      </metricGroup>
+
+
+EOF
+
+    for TOPIC in ${TOPIC_LIST} ; do
+        for BEAN in BytesIn BytesOut BytesRejected FailedFetchRequests FailedProduceRequests MessagesIn TotalFetchRequests TotalProduceRequests ; do
+            cat >> ${INSTR_XML_DIR}/kafka.xml <<EOF
+      <metricGroup name="${TOPIC}-${BEAN}">
+       <mbeanName>kafka.server:type=BrokerTopicMetrics,name=${BEAN}PerSec,topic=${TOPIC}</mbeanName>
+        <metric name="Count" />
+      </metricGroup>
+EOF
+        done
+    done
+    cat >>  ${INSTR_XML_DIR}/kafka.xml <<EOF
+    </provider>
+  </profile>
+
+  <profile name="kafka-lr">
+    <description>A low resolution profiler for kafka</description>
+    <pollInterval>1800</pollInterval>
+    <provider type="jmx" name="kafka_lr">
+     <searchString>.*-Ds=${MATCH_STRING}.*</searchString>
+EOF
+
+    for TOPIC in ${TOPIC_LIST} ; do
+        PARTITION_LIST=$(${_LS} /ericsson/kafka/data | ${_EGREP} "^${TOPIC}-" | ${_SED} "s/${TOPIC}-//g" | ${_SORT} -n)
+        for PARTITION in ${PARTITION_LIST} ; do
+            cat >> ${INSTR_XML_DIR}/kafka.xml <<EOF
+      <metricGroup name="LogEndOffset-${TOPIC}-${PARTITION}">
+       <mbeanName>kafka.log:type=Log,name=LogEndOffset,topic=${TOPIC},partition=${PARTITION}</mbeanName>
+       <metric name="Value" />
+      </metricGroup>
+      <metricGroup name="ReplicasCount-${TOPIC}-${PARTITION}">
+       <mbeanName>kafka.cluster:type=Partition,name=ReplicasCount,topic=${TOPIC},partition=${PARTITION}</mbeanName>
+       <metric name="Value" />
+      </metricGroup>
+EOF
+        done
+    done
+
+    cat >> ${INSTR_XML_DIR}/kafka.xml <<EOF
+    </provider>
+  </profile>
+</instr>
+EOF
+}
+
+writeAsrDriverInstr() {
+    local INSTR_XML_DIR=$1
+    local DRIVER_TYPE=$2
+
+    initClusterDataDir
+    ASR_DIR=${CLUSTEREDDATA_DIR}/${DRIVER_TYPE}
+    if [ ! -d ${ASR_DIR} ] ; then
+        ${_MKDIR} ${ASR_DIR}
+    fi
+
+    ${UTILDIR}/bin/e2eXMLGenerator --metricsdir ${INSTR_XML_DIR} \
+              --config ${TOR_MONITORDIR}/e2e.properties \
+              --jvmname ${DRIVER_TYPE}-driver
+    # As the driver could be running on any of the ASR VMs
+    # we write the instr to a "cluster" directory by
+    # adding a outputHandler
+    if [ -r ${INSTR_XML_DIR}/e2e_${DRIVER_TYPE}-driver.xml ] ; then
+        ${_SED} -i "s|<pollInterval>60</pollInterval>|<pollInterval>60</pollInterval> <outputHandler type=\"simple\" file=\"${ASR_DIR}/instr.txt\"/>|" \
+                ${INSTR_XML_DIR}/e2e_${DRIVER_TYPE}-driver.xml
+        ${_CP} -f ${INSTR_XML_DIR}/e2e_${DRIVER_TYPE}-driver.xml ${ASR_DIR}
+    fi
+}
+
+writeSolrCoresStatus() {
+    $_CURL --silent --output ${DATAROOT}/${DATE}/TOR/solr_cores_status.xml 'http://localhost:8983/solr/admin/cores?action=STATUS'
+}
+
+collectSolrCoreStatus() {
+    local JBOSS_INSTANCE=$($_PS -e -o args | $_SED -n 's:^java.*-Djboss.node.name=\([^ ]*\).*:\1:p')
+    if [ -z "${JBOSS_INSTANCE}" ] && [ -d /ericsson/solr ] ; then
+        writeSolrCoresStatus
+    fi
+}
+
+writeSolrInstr() {
+    local INSTR_XML_DIR=$1
+
+    if [ -z "${CORE_LIST}" ] ; then
+        writeSolrCoresStatus
+        CORE_LIST=$(/usr/bin/xmllint --format ${DATAROOT}/${DATE}/TOR/solr_cores_status.xml |  ${_GREP} 'str name="name"' | $_SED -e 's/.*">//' -e 's/<.*//')
+        if [ -z "${CORE_LIST}" ] ; then
+            return
+        fi
+    fi
+
+    if [ -z "${JMX_SERVICE_URL}" ] ; then
+        local CONNECTION_INFO="<searchString>.*-Dname=solr.*</searchString>"
+    else
+        local CONNECTION_INFO="<ipService jmxurl=\"${JMX_SERVICE_URL}\"/>"
+    fi
+
+    cat > ${INSTR_XML_DIR}/solrcore.xml <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+  <createdBy>writeSolrInstr</createdBy>
+  <profile name="solrcore">
+    <description>A profiler for solr MBeans</description>
+    <pollInterval>60</pollInterval>
+    <provider type="jmx" name="solrcore">
+     ${CONNECTION_INFO}
+EOF
+    for CORE in ${CORE_LIST} ; do
+        cat >> ${INSTR_XML_DIR}/solrcore.xml <<EOF
+      <metricGroup name="${CORE}-update">
+       <mbeanName>solr/${CORE}:type=/update,id=org.apache.solr.handler.UpdateRequestHandler</mbeanName>
+        <metric name="requests" />
+        <metric name="totalTime" />
+        <metric name="errors" />
+        <metric name="timeouts" />
+      </metricGroup>
+      <metricGroup name="${CORE}-updatejson">
+       <mbeanName>solr/${CORE}:type=/update/json,id=org.apache.solr.handler.UpdateRequestHandler</mbeanName>
+        <metric name="requests" />
+        <metric name="totalTime" />
+        <metric name="errors" />
+        <metric name="timeouts" />
+      </metricGroup>
+      <metricGroup name="${CORE}-select">
+       <mbeanName>solr/${CORE}:type=/select,id=org.apache.solr.handler.component.SearchHandler</mbeanName>
+        <metric name="requests" />
+        <metric name="totalTime" />
+        <metric name="errors" />
+        <metric name="timeouts" />
+      </metricGroup>
+      <metricGroup name="${CORE}-searcher">
+         <mbeanName>solr/${CORE}:type=searcher,id=org.apache.solr.search.SolrIndexSearcher</mbeanName>
+        <metric name="numDocs" />
+        <metric name="deletedDocs" />
+      </metricGroup>
+      <metricGroup name="${CORE}-documentCache">
+       <mbeanName>solr/${CORE}:type=documentCache,id=org.apache.solr.search.LRUCache</mbeanName>
+        <metric name="cumulative_evictions" />
+        <metric name="cumulative_hits" />
+        <metric name="cumulative_inserts" />
+        <metric name="cumulative_lookups" />
+        <metric name="size" />
+      </metricGroup>
+EOF
+    done
+    cat >> ${INSTR_XML_DIR}/solrcore.xml <<EOF
+    </provider>
+  </profile>
+</instr>
+EOF
+}
+
+writeConnTrackInstr() {
+    local INSTR_XML_DIR=$1
+    cat > ${INSTR_XML_DIR}/conntrack.xml <<EOF
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>writeConnTrackInstr</createdBy>
+    <profile name="nf_conntrack">
+        <description>A profiler for nf_conntrack</description>
+        <provider type="file" name="nf_conntrack" file="/proc/sys/net/netfilter/nf_conntrack_count">
+         <metric name="nf_conntrack_count"/>
+        </provider>
+    </profile>
+</instr>
+EOF
+}
+
+writeElasticsearchJmx() {
+  ES_CONFIG_FILE="/etc/elasticsearch/elasticsearch.yml"
+
+  if [ -f ${ES_CONFIG_FILE} ]; then
+    ES_DATA_PATH=$($_GREP "path.data" ${ES_CONFIG_FILE} | $_CUT -d":" -f2 | $_TR -d '[:space:]')
+    if [ -d ${ES_DATA_PATH} ]; then
+      logInfo "Writing elasticsearch JMX data"
+      writeGenericJmx 'elasticsearch' '.*org\.elasticsearch\.bootstrap\.Elasticsearch.*' "${INSTR_DIR}"
+    fi
+  fi
+}
+
+writeEShistoryJmx() {
+  ES_CONFIG_FILE="/etc/eshistory/elasticsearch.yml"
+
+  if [ -f ${ES_CONFIG_FILE} ]; then
+    ES_DATA_PATH=$($_GREP "path.data" ${ES_CONFIG_FILE} | $_CUT -d":" -f2 | $_TR -d '[:space:]')
+    if [ -d ${ES_DATA_PATH} ]; then
+      logInfo "Writing eshistory JMX data"
+      writeGenericJmx 'eshistory' '.*org\.elasticsearch\.bootstrap\.Elasticsearch.*eshistory\.pid.*' "${INSTR_DIR}"
+    fi
+  fi
+}
+
+
+# To speed up start up of instr, if there are instr files for yesterday
+# available, then we just copy those
+createOrCopyInstrXmls() {
+    local SERVICE_GROUP="$1"
+
+    local GENERATE=1
+    if [ -d ${DATAROOT}/config/instr ] ; then
+        local FILE_COUNT=$($_LS ${DATAROOT}/config/instr | $_WC -l)
+        if [ ${FILE_COUNT} -gt 0 ] ; then
+            GENERATE=0
+        fi
+    else
+        ${_MKDIR} ${DATAROOT}/config/instr
+    fi
+    if [ ${GENERATE} -eq 1 ] ; then
+        createInstrXmls "${SERVICE_GROUP}" ${DATAROOT}/config/instr
+    else
+        # Force the next TRIGGER to run regenerateInstrXmls to see if
+        # there are any new MBeans/attributes
+        $_TOUCH ${DATAROOT}/${DATE}/INSTR_REGENERATE
+    fi
+}
+
+#
+# Functions used by trigger
+#
+
+checkInstrXmls() {
+    # If 'instr' directory does not exist or is empty then try to regenerate
+    #  all Instr XMLs
+    #
+    # Regenerate if any of the following is true
+    # - INSTR_REGENERATE exists
+    # - We have zero XML files and DDC is up for less then 4 hours
+    # - We're in the DB cluster and the cluster state has changed
+    # - We're in a VM and DDC is up for less then 4 hours
+    #
+    local REGENERATE_INSTR_XMLS=false
+
+    if [ ! -s /var/run/ddc.pid ] ; then
+        # If there's no ddc pid file then we're not running as a service
+        # so nothing more to do
+        return
+    fi
+
+    local DDC_START_TIME=$(${_STAT} --format '%Y' /var/run/ddc.pid)
+    local NOW=$(${_DATE} +%s)
+    local DDC_UPTIME=$($_EXPR ${NOW} - ${DDC_START_TIME})
+
+    local FILE_COUNT=0
+    if [ -d ${DATAROOT}/${DATE}/instr ] ; then
+        FILE_COUNT=$($_LS ${DATAROOT}/${DATE}/instr | $_WC -l)
+    fi
+
+    local FOUR_HOURS=14400
+
+    if [ -r ${DATAROOT}/${DATE}/INSTR_REGENERATE ] ; then
+        REGENERATE_INSTR_XMLS=true
+    elif [ ${FILE_COUNT} -eq 0 ] && [ ${DDC_UPTIME} -lt ${FOUR_HOURS} ] ; then
+        REGENERATE_INSTR_XMLS=true
+        # Check if 'instr' directory exits and try to create one if it doesn't
+        if [ ! -d ${DATAROOT}/${DATE}/instr ] ; then
+            $_MKDIR ${DATAROOT}/${DATE}/instr
+            if [ $? -ne 0 ] ; then
+                logWarning "Failed to create ${DATAROOT}/${DATE}/instr directory"
+                return
+            fi
+        fi
+    elif [ -d /opt/VRTSvcs ] ; then
+        initHaclusList
+        if [ "${HACLUS_LIST}" = "db_cluster" ] ; then
+            HAGRP_STATE_FILE="${DATAROOT}/${DATE}/TOR/hagrp_state.txt"
+            HAGRP_STATE_FILE_TMP="${DATAROOT}/${DATE}/TOR/hagrp_state_tmp.txt"
+            # Get the state using 'hagrp -state' and compare it with that
+            #  collected during last TRIGGER
+            $_HAGRP -state | $_SORT > ${HAGRP_STATE_FILE_TMP}
+            if [ -r "${HAGRP_STATE_FILE}" ] && $_CMP -s ${HAGRP_STATE_FILE} ${HAGRP_STATE_FILE_TMP} ; then
+                REGENERATE_INSTR_XMLS=false
+            else
+                REGENERATE_INSTR_XMLS=true
+            fi
+            $_MV ${HAGRP_STATE_FILE_TMP} ${HAGRP_STATE_FILE}
+        elif [ ${DDC_UPTIME} -lt ${FOUR_HOURS} ] ; then
+            REGENERATE_INSTR_XMLS=true
+        fi
+    elif [ ${DDC_UPTIME} -lt ${FOUR_HOURS} ] ; then
+        REGENERATE_INSTR_XMLS=true
+    fi
+
+    if [ ${REGENERATE_INSTR_XMLS} = true ] ; then
+        regenerateInstrXmls ${DATAROOT}/config/instr
+    fi
+}
+
+regenerateInstrXmls() {
+    local INSTR_DIR=$1
+    local INSTR_TMP_DIR="${INSTR_DIR}tmp"
+
+    # Create 'instrtmp' directory, if it does not already exist
+    if [ ! -d ${INSTR_TMP_DIR} ] ; then
+        $_MKDIR ${INSTR_TMP_DIR}
+        if [ $? -ne 0 ] ; then
+            logWarning "Failed to create ${INSTR_TMP_DIR} directory"
+            return
+        fi
+    fi
+
+    # Get the service group of the host
+    if [ -z "${SERVICE_GROUP}" ] ; then
+        SERVICE_GROUP=$(getServiceGroup)
+    fi
+
+    # Regenerate Instr XML files
+    logDebug "Regenerating Instr XML files"
+    createInstrXmls "${SERVICE_GROUP}" "${INSTR_TMP_DIR}"
+    # If createInstrXmls fails then abort regeneration
+    if [ ! -z "${CREATE_INSTR_XML_ERROR}" ] ; then
+        logWarning "regenerateInstrXmls: ${CREATE_INSTR_XML_ERROR}"
+        ${_RM} -rf ${INSTR_TMP_DIR}
+        return
+    fi
+    # createInstrXmls was successful, so if we're being called because the INSTR_REGENERATE
+    # file, we can remove it now
+    if [ -r ${DATAROOT}/${DATE}/INSTR_REGENERATE ] ; then
+        ${_RM} ${DATAROOT}/${DATE}/INSTR_REGENERATE
+    fi
+
+    # Check for XML similarity between 'instr' & 'instrtmp' XML files and
+    #  update 'instr' XMLs in case of any new changes
+    local XML_TO_BE_UPDATED=""
+    local DIFF_FILE=$(${_DIRNAME} ${INSTR_DIR})
+    DIFF_FILE="${DIFF_FILE}/instr.diff"
+    ${_DIFF} -rq ${INSTR_DIR} ${INSTR_TMP_DIR} > ${DIFF_FILE} 2>&1
+    local DIFF_RESULT=$?
+    # 0 => dirs are identical, nothing to do
+    # 1 => dirs are different so processing the diff
+    # 2 => diff failed so log error and return
+    if [ ${DIFF_RESULT} -eq 0 ] ; then
+        logDebug "regenerateInstrXmls: no changes detected"
+        ${_RM} -rf ${INSTR_TMP_DIR} ${DIFF_FILE}
+        return
+    elif [ ${DIFF_RESULT} -eq 2 ] ; then
+        logWarning "regenerateInstrXmls: Diff failed, aborting"
+        return
+    fi
+
+    while read -r DIFF_LINE ; do
+        local FIRST_WORD=$(${_ECHO} "${DIFF_LINE}" | ${_AWK} '{print $1}')
+        if [ "${FIRST_WORD}" = "Files" ] ; then
+            local FILE_PATH=$(${_ECHO} "${DIFF_LINE}" | ${_AWK} '{print $2}')
+            local XML_FILE=$(${_BASENAME} ${FILE_PATH})
+            local XML_TO_BE_UPDATED="${XML_TO_BE_UPDATED} ${XML_FILE}"
+            logInfo "regenerateInstrXmls: Removing ${INSTR_DIR}/${XML_FILE} as it has been modified"
+            ${_RM} -f ${INSTR_DIR}/${XML_FILE}
+        elif [ "${FIRST_WORD}" = "Only" ] ; then
+            local ONLY_DIR=$(${_ECHO} "${DIFF_LINE}" | ${_AWK} '{print $3}' | ${_SED} 's/:$//')
+            local ONLY_FILE=$(${_ECHO} "${DIFF_LINE}" | ${_AWK} '{print $4}')
+            if [ "${ONLY_DIR}" = "${INSTR_TMP_DIR}" ] ; then
+                # New file added
+                logInfo "regenerateInstrXmls: adding ${ONLY_FILE}"
+                $_MV ${INSTR_TMP_DIR}/${ONLY_FILE} ${INSTR_DIR}
+            elif [ "${ONLY_DIR}" = "${INSTR_DIR}" ] ; then
+                logInfo "regenerateInstrXmls: removing ${ONLY_FILE}"
+                ${_RM} -f ${INSTR_DIR}/${ONLY_FILE}
+            fi
+        fi
+    done < ${DIFF_FILE}
+    ${_RM} -f ${DIFF_FILE}
+
+    # Sleep for one second and move the XMLs with new updates from 'instrtmp'
+    #  directory to 'instr' directory
+    if [ ! -z "${XML_TO_BE_UPDATED}" ] ; then
+        for XML_FILE_TBU in ${XML_TO_BE_UPDATED} ; do
+            logInfo "regenerateInstrXmls: Replacing ${XML_FILE_TBU} under instr directory with the regenerated file which appears to have new updates"
+            $_SLEEP 1
+            $_MV ${INSTR_TMP_DIR}/${XML_FILE_TBU} ${INSTR_DIR}/
+        done
+    fi
+    ${_RM} -rf ${INSTR_TMP_DIR}
+}
+
+verifyInstrStarted() {
+    # Start 'Instr' process if it is not already running but 'instr' directory
+    #  has some XML files in it.
+    local XML_FILE_COUNT=$($_LS ${DATAROOT}/config/instr | $_GREP -c ".*.xml")
+    if [ ${XML_FILE_COUNT} -gt 0 ] ; then
+        INSTR_PROC=$(${UTILDIR}/bin/jps --wide | $_GREP "Ds=instr" | $_GREP -v $_GREP)
+        if [ -z "${INSTR_PROC}" ] ; then
+            startInstrExporter
+        fi
+    fi
+}
+
+restartInstr() {
+    logDebug "Restarting instr process"
+    stopInstr
+    startInstrExporter
+}
+
+setInstrClassPath() {
+    # Setup extra CLASSPATH for instr
+    if [ -r /ericsson/3pp/jboss/bin/client/jboss-client.jar ] ; then
+        CLASSPATH="/ericsson/3pp/jboss/bin/client/jboss-client.jar:${CLASSPATH}"
+    fi
+    if [ -d /opt/ericsson/ERICdpsupgrade/sut/lib ] ; then
+        for JAR in javax.persistence versant-jpa slf4j-api antlr-runtime asm-all ; do
+            JAR_PATH=$(find /opt/ericsson/ERICdpsupgrade/sut/lib -name "${JAR}*.jar" | tail -1)
+            if [ ! -z "${JAR_PATH}" ] ; then
+                CLASSPATH=${CLASSPATH}:${JAR_PATH}
+            fi
+        done
+    fi
+    export CLASSPATH
+}
+
+getInternalIP() {
+    if [ -r /var/log/cloud-init-output.log ] ; then
+        local INTERNAL_SUBNET=$(${_EGREP} '^internal_subnet=' /ericsson/tor/data/global.properties | ${_AWK} -F= '{print $2}')
+
+        read -r -d '' AWK_SCRIPT <<'EOF'
+BEGIN { FS="[. /]" }
+{
+    ip  = lshift($1, 24) + lshift($2, 16) + lshift($3, 8) + $4;
+    net = lshift(rshift(ip, 32 - $5), 32 - $5);
+
+    printf("%d.%d.%d.%d/%d\n",
+    and(rshift(net, 24), 0xff),
+    and(rshift(net, 16), 0xff),
+    and(rshift(net,  8), 0xff),
+    and(net, 0xff), $5);
+}
+EOF
+
+        local IP_ADDR_LIST=$(ip -4 -o addr | ${_AWK} '{print $4}')
+        INTERNAL_IP=""
+        for IP in ${IP_ADDR_LIST} ; do
+            local IP_SUBNET=$(${_ECHO} ${IP} | ${_AWK} "${AWK_SCRIPT}")
+            if [ "${IP_SUBNET}" = "${INTERNAL_SUBNET}" ] ; then
+                INTERNAL_IP=$(${_ECHO} "${IP}" | ${_AWK} -F \/ '{print $1}')
+            fi
+        done
+    else
+        # On phyiscal hosts, there can be multiple IP addresses on the internal network (Serivce VIPs)
+        # So we get the INTERNAL_IP from the entry in the hosts file for the hostname
+        INTERNAL_IP=$(cat /etc/hosts  | awk -v hostname=$(hostname) '{if (($2 == hostname) && ($0 ~ /Created by LITP/)) {print $1}}')
+    fi
+
+    if [ -z "${INTERNAL_IP}" ] ; then
+        echo "WARN: Coud not get internal IP address, defaulting to 127.0.0.1"
+        INTERNAL_IP="127.0.0.1"
+    fi
+}
+
+startInstrExporter() {
+    ${_PGREP} -f s=instr > /dev/null
+    if [ $? -eq 0 ] ; then
+        echo "WARN: startInstrExporter called but instr already running"
+        return
+    fi
+
+    INSTR_DIR=${DATAROOT}/config/instr
+
+    local XML_FILE_COUNT=$($_LS ${DATAROOT}/config/instr | $_GREP -c ".*.xml")
+    if [ ${XML_FILE_COUNT} -eq 0 ] ; then
+        echo "WARN: startInstrExporter but no XML files found"
+        return
+    fi
+
+    getInternalIP
+
+    # In vENM, consul should be present inside every VM
+    if [ -r /etc/consul.d/agent/config.json ] ; then
+        local CONSUL_HOST=localhost
+    else
+        local CONSUL_HOST=kvstore
+    fi
+
+    [ -f ${INSTR_DIR}/instr.exit ] && $_RM -f ${INSTR_DIR}/instr.exit
+
+    if [ -r ${DATAROOT}/log/instr.log ] ; then
+        ${_MV} ${DATAROOT}/log/instr.log ${DATAROOT}/log/instr.log.bak
+    fi
+
+    local SERVICE_GROUP_ARG=""
+    local MY_SERVICE_GROUP=$(getServiceGroup)
+    if [ ! -z "${MY_SERVICE_GROUP}" ] ; then
+        # If we're on a DB node, there can be multiple service group RPMs installed
+        # So we can specific the "correct" one, so don't set any
+        local MY_NUM_SERVICE_GROUP=$($_ECHO "${MY_SERVICE_GROUP}" | $_WC -w | ${_AWK} '{print $1}')
+        if [ ${MY_NUM_SERVICE_GROUP} -eq 1 ] ; then
+            SERVICE_GROUP_ARG="--servicegroup ${MY_SERVICE_GROUP}"
+        fi
+    fi
+
+    setInstrClassPath
+    ${UTILDIR}/bin/instr -pollDir ${INSTR_DIR} \
+        --exporter ${INTERNAL_IP}:6789 --consul ${CONSUL_HOST} ${SERVICE_GROUP_ARG} \
+        > ${DATAROOT}/log/instr.log 2>&1 &
+}
+
+stopInstr() {
+    logDebug "Stopping instr process"
+
+    local INSTR_DIR=${DATAROOT}/config/instr
+    $_TOUCH ${INSTR_DIR}/instr.exit
+
+    local INSTR_CHECK_TIMEOUT="30"
+    while [ "${INSTR_CHECK_TIMEOUT}" -gt 0 ] ; do
+        INSTR_PS=$(${UTILDIR}/bin/jps --wide | $_GREP "Ds=instr" | $_GREP -v $_GREP)
+        if [ -z "${INSTR_PS}" ] ; then
+            break
+        fi
+        ((INSTR_CHECK_TIMEOUT--))
+        $_SLEEP 1
+    done
+
+    if [ "${INSTR_CHECK_TIMEOUT}" -eq 0 ] ; then
+        logWarning "Killing instr process on timeout"
+        ${UTILDIR}/bin/jps --wide | $_GREP "Ds=instr" | $_GREP -v $_GREP | $_AWK '{print $1}' | $_XARGS $_KILL -9 > /dev/null 2>&1
+        if [ -f ${INSTR_DIR}/instr.exit ] ; then
+            $_RM -f ${INSTR_DIR}/instr.exit
+        fi
+    fi
+}
+
+##############################################################################################
+#################################### COLLECTION FUNCTIONS ####################################
+##############################################################################################
+
+collectSmrsSftpLog() {
+    if [ ! -d /home/smrs/smrsroot/sftppslog/${DATE}/${THISHOST} ] ; then
+        return
+    fi
+    logDebug "Collecting smrs sftp logs"
+    [ ! -d ${OUTPUT_DIR}/smrs ] && $_MKDIR ${OUTPUT_DIR}/smrs
+    if [ -r "/home/smrs/smrsroot/sftppslog/${DATE}/${THISHOST}/sftpps.log" ] ; then
+        $_CP /home/smrs/smrsroot/sftppslog/${DATE}/${THISHOST}/sftpps.log ${OUTPUT_DIR}/smrs/
+    fi
+}
+
+collectJbossLogs() {
+    if [ ! -d /ericsson/3pp/jboss/standalone/log ] ; then
+        return
+    fi
+
+    logDebug "Collecting JBoss logs"
+
+    [ ! -d ${OUTPUT_DIR}/jboss ] && $_MKDIR ${OUTPUT_DIR}/jboss
+    for LOG_FILE in ["console.log" "JbossInstanceStatus.log"] ; do
+        if [ -f "${LOG_FILE}" ] ; then
+            $_CP /ericsson/3pp/jboss/standalone/log/${LOG_FILE} ${OUTPUT_DIR}/jboss/
+        fi
+    done
+}
+
+collectJbossLoggingConfig() {
+    local LOG_CONFIG_FILE="/ericsson/3pp/jboss/standalone/configuration/logging.properties"
+    if [ -r ${LOG_CONFIG_FILE} ] ; then
+        logDebug "Collecting JBoss standalone logging.properties file"
+
+        [ ! -d ${OUTPUT_DIR}/jboss ] && $_MKDIR ${OUTPUT_DIR}/jboss
+        $_ECHO "# DDC: CollectionTime='${SQL_DATE_ONLY} ${TIME}:00'" > ${OUTPUT_DIR}/jboss/logging_standalone.properties
+        $_CAT ${LOG_CONFIG_FILE} >> ${OUTPUT_DIR}/jboss/logging_standalone.properties
+    fi
+}
+
+collectCpiAnnotationsFile() {
+        if [ ! -d /ericsson/enm/alex/writable ]; then
+            return
+        fi
+
+        logDebug "Collecting CPI Annotations File"
+
+        [ ! -d ${OUTPUT_DIR}/cpi ] && $_MKDIR ${OUTPUT_DIR}/cpi
+
+        if [ -f /ericsson/enm/alex/writable/annot.anx ] ; then
+                if [  -f ${OUTPUT_DIR}/cpi/annot.anx.gz ] ; then
+                     $_RM ${OUTPUT_DIR}/cpi/annot.anx.gz
+                fi
+                $_CP /ericsson/enm/alex/writable/annot.anx ${OUTPUT_DIR}/cpi/
+                $_GZIP ${OUTPUT_DIR}/cpi/annot.anx
+
+        fi
+
+}
+
+
+collectEnmHistoryFile() {
+    ENM_HISTORY_PATH="/etc/enm-history"
+    logDebug "Collecting  enm history file"
+    if [ -f "${ENM_HISTORY_PATH}" ] ; then
+        [ ! -d ${OUTPUT_DIR}/sw_inventory ] && $_MKDIR ${OUTPUT_DIR}/sw_inventory
+        $_CP ${ENM_HISTORY_PATH} ${OUTPUT_DIR}/sw_inventory/
+    fi
+}
+
+collectPMFunctionFiles() {
+     initClusterDataDir
+     if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+         return
+     fi
+     local FLS_DIR="${CLUSTEREDDATA_DIR}/fls"
+     logDebug "Collecting PM function files"
+     [ ! -d ${FLS_DIR} ] && $_MKDIR ${FLS_DIR}
+
+     local JSON_FILE=${FLS_DIR}/FileCollectionCategory.json
+     $_CURL --silent --output ${JSON_FILE}.tmp http://localhost:8500/v1/kv/PmFileCollectionCategories?raw
+     if [ $? -eq 0 ] ; then
+         logDDCInfo "PMIC File collection is successful"
+         $_MV ${JSON_FILE}.tmp ${JSON_FILE}
+     else
+         $_CURL --silent --output ${JSON_FILE}.tmp http://kvstore:8500/v1/kv/PmFileCollectionCategories?raw
+         if [ $? -eq 0 ] ; then
+             logDDCInfo "PMIC File collection successful from kvstore"
+             $_MV ${JSON_FILE}.tmp ${JSON_FILE}
+         else
+             logDDCInfo "PMIC File collection failed"
+             $_RM -rf ${JSON_FILE}.tmp
+         fi
+     fi
+}
+
+collectGlobalProperties() {
+    local GLOBAL_PROPERTIES="/ericsson/tor/data/global.properties"
+    if [ -r ${GLOBAL_PROPERTIES} ] && [ ! -r ${OUTPUT_DIR}/global.properties ]; then
+        ${_CAT} ${GLOBAL_PROPERTIES} | ${_AWK} -F= '{if ($1 !~ /password$|^COM_INF_LDAP_ADMIN_ACCESS|PASSWORD$/) {print $0}}' > ${OUTPUT_DIR}/global.properties
+    fi
+}
+
+collectEnmProperties() {
+    local ENM_PROPERTIES="/etc/ddc.d/enm/enm.properties"
+    if [ -r ${ENM_PROPERTIES} ] ; then
+        ${_CP} ${ENM_PROPERTIES} ${OUTPUT_DIR}/enm.properties
+    fi
+}
+
+collectDeploymentType() {
+    if [ ! -z "${enm_deployment_type}" ] ; then
+        ${_ECHO} "${enm_deployment_type}" > ${OUTPUT_DIR}/enm_deployment_type
+    fi
+}
+
+collectEnmServerLogs() {
+    LITP_FORMAT_CFG="${TOR_MONITORDIR}/config/litpLogFormat.cfg"
+    MIGRATION_FORMAT_CFG="${TOR_MONITORDIR}/config/migrationLogFormat.cfg"
+    SERVER_FORMAT_CFG="${TOR_MONITORDIR}/config/serverLogFormat.cfg"
+    ENM_FORMAT_CFG="${TOR_MONITORDIR}/config/enmLogFormat.cfg"
+    ES_FORMAT_CFG="${TOR_MONITORDIR}/config/esLogFormat.cfg"
+    ESM_FORMAT_CFG="${TOR_MONITORDIR}/config/esmLogFormat.cfg"
+    TOR_FORMAT_CFG="${TOR_MONITORDIR}/config/TORLogFormat.cfg"
+    SOLR_FORMAT_CFG="${TOR_MONITORDIR}/config/solrLogFormat.cfg"
+    local DAYSTART=$($_DATE --date="$SQL_DATE_ONLY" +%s)
+
+    for LOG in $LITP_FORMAT_CFG $MIGRATION_FORMAT_CFG $SERVER_FORMAT_CFG $ENM_FORMAT_CFG $ES_FORMAT_CFG $ESM_FORMAT_CFG $TOR_FORMAT_CFG $SOLR_FORMAT_CFG; do
+        if [ ${LOG} = ${LITP_FORMAT_CFG} ] ; then
+            logDebug "Collecting LITP logs"
+            DESTDIR=${OUTPUT_DIR}/litp
+        elif [ ${LOG} = ${MIGRATION_FORMAT_CFG} ] ; then
+            logDebug "Collecting Migration logs"
+            DESTDIR=${OUTPUT_DIR}/migration
+        elif [ ${LOG} = ${SERVER_FORMAT_CFG} ] ; then
+            logDebug "Collecting Server logs"
+            DESTDIR=${DATAROOT}/${DATE}/server
+        elif [ ${LOG} = ${ENM_FORMAT_CFG} ] ; then
+            logDebug "Collecting ENM logs"
+            DESTDIR=${OUTPUT_DIR}/sw_inventory
+        elif [ ${LOG} = ${ES_FORMAT_CFG} ] ; then
+            logDebug "Collecting ElasticSearch logs"
+            DESTDIR=${OUTPUT_DIR}
+        elif [ ${LOG} = ${ESM_FORMAT_CFG} ] ; then
+            logDebug "Collecting ESM logs"
+            DESTDIR=${OUTPUT_DIR}/esm
+        elif [ ${LOG} = ${TOR_FORMAT_CFG} ] ; then
+            logDebug "Collecting TOR logs"
+            DESTDIR=${OUTPUT_DIR}
+        elif [ ${LOG} = ${SOLR_FORMAT_CFG} ] ; then
+            logDebug "Collecting Solr logs"
+            DESTDIR=${OUTPUT_DIR}
+        fi
+
+        #Populate a list of the filenames from the LITP_Log_Formats
+        #Ignore any comment lines.
+        FILELIST=$($_SED -e 's/#.*$//' -e '/^[[:space:]]*$/d' ${LOG} | $_AWK -F: '{ print $1 }')
+
+        # Collect files
+        for FILE_STRING in ${FILELIST} ; do
+            # Escape special characters so that they don't get picked up as regex characters during AWK
+            ESCAPED_FILE_STRING=$( $_ECHO "$FILE_STRING" | $_SED -e 's/[^a-zA-Z0-9,._+@%/-]/\\&/g; 1{$s/^$/""/}; 1!s/^/"/; $!s/$/"/' )
+            # Check what action is required for the current file (i.e. Bulk Copy or a CAT for todays data).
+            ACTION=$($_CAT ${LOG} | $_AWK -F: '$1 ~ /'^${ESCAPED_FILE_STRING}$'/ { print $5 }')
+            # Populate the Log Directory location of the current file.
+            LOGDIR=$($_CAT ${LOG} | $_AWK -F: '$1 ~ /'^${ESCAPED_FILE_STRING}$'/ { print $2 }')
+            DIR_FILE_STRING="${LOGDIR}/${FILE_STRING}"
+            VALID_FILES="FALSE";
+            VALID_FILES_LIST=();
+            for FILE in $DIR_FILE_STRING; do
+                if [ -f "$FILE" ] ; then
+                    if [[ ${ACTION} == "COPY" ]]; then
+                        VALID_FILES="TRUE";
+                    else
+                        local FILE_MOD_TIME=$($_STAT --format %Y $FILE)
+                        if [[ $FILE_MOD_TIME -ge $DAYSTART ]]; then
+                            VALID_FILES="TRUE"
+                            VALID_FILES_LIST+=(${FILE});
+                        fi
+                    fi
+                else
+                    VALID_FILES="FALSE"
+                    break
+                fi
+            done
+            # If ACTION not copy and more than one valid file exists, use the file list from now.
+            if [[  ${#VALID_FILES_LIST[@]} -ge 1 ]]; then
+                DIR_FILE_STRING=""
+                for FILE_NAME in "${VALID_FILES_LIST[@]}" ; do
+                    DIR_FILE_STRING="${DIR_FILE_STRING} ${FILE_NAME}"
+                done
+            fi
+
+            if [[ ${VALID_FILES} = "TRUE" ]] ; then
+                #Populate the destination file name. If not specified set it the same as the source file name.
+                DESTFILE=$($_CAT ${LOG} | $_AWK -F: '$1 ~ /'^${ESCAPED_FILE_STRING}$'/ { print $6 }')
+                if [ -z ${DESTFILE} ] ; then
+                    DESTFILE=${FILE_STRING}
+                fi
+                if [[ ${ACTION} == "COPY" ]] ; then
+                    [ ! -d ${DESTDIR} ] && $_MKDIR -p ${DESTDIR}
+                    if [[ ${FILE_STRING} == "postgresql-*.log" ]] ; then
+                        COLLECT_DATA=$($_LS ${LOGDIR} | $_GREP "postgresql-$WEEK_DAY.log" | $_WC -l)
+                        if [ ${COLLECT_DATA} -eq 1 ] ; then
+                            $_CP "${LOGDIR}/postgresql-${WEEK_DAY}.log" ${DESTDIR}/
+                        fi
+                    else
+                        $_CP ${LOGDIR}/${FILE_STRING} ${DESTDIR}/${DESTFILE} &> /dev/null
+                    fi
+                else
+                    DATE_FORMAT=$($_CAT ${LOG} | $_AWK -F: '$1 ~ /'^${ESCAPED_FILE_STRING}$'/ { print $3 }')
+                    # If we have more than 1 file and a specified time format we need to build the dir file string up for each file in order of their times.
+                    TIME_FORMAT=$($_CAT ${LOG} | $_AWK -F: '$1 ~ /'^${ESCAPED_FILE_STRING}$'/ { print $4 }')
+                    # Check is there data available in the current file for todays date.
+                    [ ! -d ${DESTDIR} ] && $_MKDIR -p ${DESTDIR}
+                    $_GUNZIP -cf ${DIR_FILE_STRING} | $_GREP "${!DATE_FORMAT}" > ${DESTDIR}/${DESTFILE} 2>&1
+                    if [ ! -s ${DESTDIR}/${DESTFILE} ] ; then
+                        logInfo "No data in ${FILE_STRING} for date ${!DATE_FORMAT}."
+                        $_RM ${DESTDIR}/${DESTFILE}
+                    fi
+                fi
+            fi
+        done
+    done
+}
+
+# TORF-152862 Collect dps.log only on DB's
+collectSutLogs() {
+  if [ -f /var/log/dps.log ] ; then
+    $_AWK "/($SQL_DATE_ONLY).*/,0" "/var/log/dps.log" > ${OUTPUT_DIR}/sut.log
+  else
+    logInfo "dps.log not present in /var/log";
+  fi
+
+}
+
+# TDDDCDDP-163: Collect data on the status of VCS on LITP servers
+collectVcsStatus() {
+    llttabdata="/etc/llttab"
+
+    if [ ! -r ${llttabdata} ] ; then
+        return
+    fi
+
+    logDebug "Collecting VCS Status"
+
+    # Create directories
+    [ ! -d ${OUTPUT_DIR}/vcs ] && $_MKDIR -p ${OUTPUT_DIR}/vcs
+
+    # Files needed to collect from
+    llthostsdata="/etc/llthosts"
+
+    # Files
+    gabconfigLog="${OUTPUT_DIR}/vcs/gabconfigLog"
+    hastate="${OUTPUT_DIR}/vcs/hastate"
+    processVcs="${OUTPUT_DIR}/vcs/process"
+    llttab="${OUTPUT_DIR}/vcs/llttab"
+    llthosts="${OUTPUT_DIR}/vcs/llthosts"
+
+    #Run command for hagrp, hares and hasys
+    $_ECHO "${TIMESTAMP}" >>  ${hastate}
+    $_HARES -state >> ${hastate}
+    $_HAGRP -state >> ${hastate}
+    $_HASYS -state >> ${hastate}
+
+    #Run command for gabconfig
+    $_ECHO "${TIMESTAMP}" >> ${gabconfigLog}
+    $_GABCONFIG -a  >>  ${gabconfigLog}
+
+    #Run command for process
+    $_ECHO "${TIMESTAMP}" >>  ${processVcs}
+    $_PS -ef|$_GREP gab >> ${processVcs}
+    $_PS -ef|$_GREP llt >> ${processVcs}
+
+    #Run command for collecting lltab, llthosts files
+    $_ECHO "${TIMESTAMP}" >>  ${llttab}
+    $_ECHO "${TIMESTAMP}" >>  ${llthosts}
+    $_MORE ${llttabdata} >> ${llttab}
+    $_MORE ${llthostsdata} >> ${llthosts}
+}
+
+# TDDDCDDP-157: Collect Software Inventory data from LITP Servers
+collectRPMInfo() {
+    logDebug "Collecting RPM Information"
+    SW_INV_DIR=${OUTPUT_DIR}/sw_inventory
+    [ ! -d ${SW_INV_DIR} ] && $_MKDIR -p ${SW_INV_DIR}
+    RPM_INFO_FILE=${SW_INV_DIR}/rpm_info.txt
+    [ ! -f ${RPM_INFO_FILE} ] && $_TOUCH ${RPM_INFO_FILE}
+    $_ECHO "${TIMESTAMP}" >> ${RPM_INFO_FILE} # Write timestamp to file
+    # Set the time to POSIX standard due to litp story: LITP-2970
+    LC_TIME="C" $_RPM -qa --queryformat "%{NAME}|%{VERSION}|%{RELEASE}|%{GROUP}|%{SIZE}|%{INSTALLTIME:date}\n" >> ${RPM_INFO_FILE}
+}
+
+collectDeploymentDescription() {
+    logDebug "Collecting Deployment Description"
+    SW_INV_DIR=${OUTPUT_DIR}/sw_inventory
+    [ ! -d ${SW_INV_DIR} ] && $_MKDIR -p ${SW_INV_DIR}
+    # We've a problem with the litp export failing during an upgrade
+    # So only overwrite any existing LITP2_deployment_description if
+    # we actually get an export.
+    $_LITP export -p / > ${SW_INV_DIR}/LITP2_deployment_description.tmp
+    if [ -s ${SW_INV_DIR}/LITP2_deployment_description.tmp ] ; then
+        $_SED -i -e '/<key>.*\(password\|PASSWORD\)<\/key>/ {' -e 'n; s/<value>.*<\/value>/<value><\/value>/' -e '}' ${SW_INV_DIR}/LITP2_deployment_description.tmp
+        ${_MV} -f ${SW_INV_DIR}/LITP2_deployment_description.tmp ${SW_INV_DIR}/LITP2_deployment_description
+    else
+        ${_RM} -f ${SW_INV_DIR}/LITP2_deployment_description.tmp
+    fi
+}
+
+# LITP version
+collectLitpVersion() {
+    logDebug "Collecting LITP Version"
+    SW_INV_DIR=${OUTPUT_DIR}/sw_inventory
+    [ ! -d ${SW_INV_DIR} ] && $_MKDIR -p ${SW_INV_DIR}
+    $_LITP version > ${SW_INV_DIR}/LITP_version
+}
+
+#ENM version
+collectEnmVersion() {
+    logDebug "Collecting ENM Version Information"
+    SW_INV_DIR=${OUTPUT_DIR}/sw_inventory
+    [ ! -d ${SW_INV_DIR} ] && $_MKDIR  ${SW_INV_DIR}
+    VERSION_INFO_FILE=/opt/ericsson/enminst/bin/enm_version.sh
+    VERSION_INFO_FILE_CLOUD=/ericsson/tor/data/.enm-version
+
+    if [ -x ${VERSION_INFO_FILE} ] ; then
+        $VERSION_INFO_FILE | $_GREP "Version:" > ${SW_INV_DIR}/ENM_version
+    elif [ -r ${VERSION_INFO_FILE_CLOUD} ] ; then
+        $_CP -f ${VERSION_INFO_FILE_CLOUD} ${SW_INV_DIR}/enm_version
+    else
+        $_ECHO "Warning: Neither ${VERSION_INFO_FILE} Nor ${VERSION_INFO_FILE_CLOUD} exists (OR) none of these are accessible" > ${SW_INV_DIR}/ENM_version
+    fi
+}
+
+# Collecting Block Devices Information
+collectLsblkOutput() {
+    logInfo "Collecting lsblk output"
+    LANG=C $_LSBLK > ${SERVER_DIR}/lsblk.out
+    [ $? -ne 0 ] && logWarning "Failed to collect lsblk output"
+}
+
+collectHardwareSpec(){
+    logDebug "Collecting CPU & Memory Information"
+
+    if [ -s /etc/heat_user_data/cinder_bindings ] ; then
+        $_CP -f /etc/heat_user_data/cinder_bindings ${DATAROOT}/${DATE}/server
+    fi
+}
+
+collectPeerArchives() {
+    # DATAROOT is based on hostnames, hopeully
+    [ "$($_BASENAME ${DATAROOT} | $_AWK -F\_ '{print $1}')" != "${THISHOST}" ] && return
+
+    # Only include valid dir's in the list of hosts
+    # so that we ignore other dirs like config, lost+found, etc.
+    TOR_HOSTS=""
+    TOR_HOSTS_DEAD=""
+    BASE_DATAROOT="$($_DIRNAME ${DATAROOT})"
+    DIR_LIST=$($_LS ${BASE_DATAROOT})
+    for DIR in ${DIR_LIST} ; do
+        SERVER_DIR=$($_ECHO ${DIR} | $_AWK -F\_ '{print $1}')
+        if [ "${SERVER_DIR}" != "${THISHOST}" ] && [ "${DIR}" != "${CLUSTEREDDATA}" ] ; then
+            if [ -d "${BASE_DATAROOT}/${DIR}/${DATE}" ] || [ -r ${BASE_DATAROOT}/${DIR}/DDC_Data_${DATE}.tar.gz ] ; then
+                TOR_HOSTS="${TOR_HOSTS} ${DIR}"
+            fi
+        fi
+    done
+
+    if [ -z "${TOR_HOSTS}" ] ; then
+        # No peers (e.g. CloudNative) so nothing else to do
+        return
+    fi
+
+    # Make directory for peer nodes on management server data folder
+    SERVER_BASEDIR="${DATAROOT}/${DATE}/tor_servers"
+    if [ ! -d "${SERVER_BASEDIR}" ] ; then
+        $_MKDIR ${SERVER_BASEDIR} || logErrorAndDie "Could not make ${SERVER_BASEDIR}"
+    fi
+
+    LOOP_COUNT=0
+    MAX_RETRIES=30
+    while [ ! -z "${TOR_HOSTS}" ] && [ ${LOOP_COUNT} -lt ${MAX_RETRIES} ] ; do
+        # wait one minute so we allow tar file creation to complete
+        $_SLEEP 60
+        REMAINING_HOSTS_DEAD=""
+        REMAINING_HOSTS_ACTIVE=""
+        for TOR_HOST in ${TOR_HOSTS} ${TOR_HOSTS_DEAD} ; do
+            if [ -d "${BASE_DATAROOT}/${TOR_HOST}" ] ; then
+                # collect tar file
+                logDebug "Checking ${TOR_HOST} for archive files"
+                if [ ! -d "${SERVER_BASEDIR}/${TOR_HOST}" ] ; then
+                    $_MKDIR ${SERVER_BASEDIR}/${TOR_HOST} || logErrorAndDie "Could not make ${SERVER_BASEDIR}/${TOR_HOST}"
+                fi
+                TODAYS_FILE="${BASE_DATAROOT}/${TOR_HOST}/DDC_Data_${DATE}.tar.gz"
+                ALL_FILES=$($_FIND ${BASE_DATAROOT}/${TOR_HOST} -maxdepth 1 -name 'DDC_Data_*.tar.gz')
+                FOUND_TODAY=false
+                for file in ${ALL_FILES} ; do
+                    if [ "${file}" = "${TODAYS_FILE}" ] ; then
+                        FOUND_TODAY=true
+                    fi
+                    logDebug "Collecting ${file}"
+                    $_MV ${file} ${SERVER_BASEDIR}/${TOR_HOST}
+                done
+                if [ "${FOUND_TODAY}" = "false" ] ; then
+                    # Skip checking for the archive file if DDC failed to trigger the MAKETAR
+                    #  on the given host
+                    if [ -f ${BASE_DATAROOT}/${TOR_HOST}/.failedToTrigger ] ; then
+                        REMAINING_HOSTS_DEAD="${REMAINING_HOSTS_DEAD} ${TOR_HOST}"
+                    else
+                        DDC_COMMAND=""
+                        if [ -r ${BASE_DATAROOT}/${TOR_HOST}/.ddcCommandRemote ] ; then
+                            DDC_COMMAND=$($_CAT ${BASE_DATAROOT}/${TOR_HOST}/.ddcCommandRemote)
+                        fi
+
+                        # Consider a given host dead/inactive if MAKETAR '.ddcCommandRemote' file
+                        #  exists under its '/var/ericsson/ddc_data/<HOSTNAME>_TOR/' directory
+                        #  even after 3 min from the start of MAKETAR
+                        if [ ${LOOP_COUNT} -ge 2 ] && [ "${DDC_COMMAND}" = "MAKETAR" ] ; then
+                            REMAINING_HOSTS_DEAD="${REMAINING_HOSTS_DEAD} ${TOR_HOST}"
+                        else
+                            REMAINING_HOSTS_ACTIVE="${REMAINING_HOSTS_ACTIVE} ${TOR_HOST}"
+                        fi
+                    fi
+                fi
+            fi
+        done
+
+        # Iterate again only if there are active hosts for which we still need collect an
+        #  archive file
+        TOR_HOSTS=${REMAINING_HOSTS_ACTIVE}
+        TOR_HOSTS_DEAD=${REMAINING_HOSTS_DEAD}
+
+        let LOOP_COUNT=($LOOP_COUNT+1)
+    done
+
+    if [ ! -z "${TOR_HOSTS}" ] || [ ! -z "${TOR_HOSTS_DEAD}" ] ; then
+        logWarning "Unable to collect archive file on these hosts due to timeout: ${TOR_HOSTS}"
+        logWarning "Unable to collect archive file on these hosts since they either are dead or have no DDC running: ${TOR_HOSTS_DEAD}"
+        logWarning "Missed collecting an archive file for today from: ${TOR_HOSTS} ${TOR_HOSTS_DEAD}"
+
+        for TOR_HOST in ${TOR_HOSTS} ${TOR_HOSTS_DEAD} ; do
+            [ -f ${BASE_DATAROOT}/${TOR_HOST}/.failedToTrigger ] && $_RM -f ${BASE_DATAROOT}/${TOR_HOST}/.failedToTrigger
+
+            # Lets try and collect some of the data for the host ourselves, i.e just tar up what's in the directory
+            logInfo "Attempting to create ${SERVER_BASEDIR}/${TOR_HOST}/DDC_Data_${DATE}.tar.gz"
+            ${_GTAR} --create --file ${SERVER_BASEDIR}/${TOR_HOST}/DDC_Data_${DATE}.tar.gz \
+                     --directory=${BASE_DATAROOT}/${TOR_HOST} --gzip ${DATE}
+        done
+    fi
+}
+
+triggerOnPeerNodes() {
+    ACTION=$1
+    logDebug "Triggering ${ACTION} on peer nodes"
+    prechecks
+
+    # Determine list of TOR hostnames from NAS share (i.e. DDC dataroot)
+    BASE_DATAROOT="$($_DIRNAME ${DATAROOT})"
+    TOR_HOSTS=$($_LS ${BASE_DATAROOT} | $_GREP _[A-Z][A-Z]*$)
+
+    # Trigger each host in the list to make a tar file
+    for TOR_HOST in ${TOR_HOSTS} ; do
+        # Verify host by checking for a data folder for today
+        if [[ -d ${BASE_DATAROOT}/${TOR_HOST}/${DATE} ]] ; then
+            logDebug "Triggering ${TOR_HOST} to ${ACTION}"
+            SERVER_NAME=$($_ECHO ${TOR_HOST} | $_AWK -F\_ '{print $1}')
+            # Trigger maketar on the DDC process running on this host
+            if [[ "${SERVER_NAME}" != "${THISHOST}" ]] ; then
+                TRIGGER_FAILED_FLAG_FILE="${BASE_DATAROOT}/${TOR_HOST}/.failedToTrigger"
+                if [ -f ${TRIGGER_FAILED_FLAG_FILE} ] ; then
+                    $_RM -f ${TRIGGER_FAILED_FLAG_FILE}
+                fi
+
+                if [[ ! -f "${BASE_DATAROOT}/${TOR_HOST}/.ddcCommandRemote" ]] ; then
+                    $_ECHO "${ACTION}" > ${BASE_DATAROOT}/${TOR_HOST}/.ddcCommandRemote
+                else
+                    if [ "$($_CAT ${BASE_DATAROOT}/${TOR_HOST}/.ddcCommandRemote)" != "${ACTION}" ] ; then
+                       $_TOUCH ${TRIGGER_FAILED_FLAG_FILE}
+                    fi
+                    logWarning "Could not trigger ${ACTION} on ${TOR_HOST}: .ddcCommandRemote exists!"
+                fi
+            fi
+        fi
+    done
+}
+
+waitDeltaOnPeerNodes() {
+    # Only include valid dir's in the list of hosts
+    # so that we ignore other dirs like config, lost+found, etc.
+    declare -a TOR_HOSTS
+    local MY_DIR=$($_BASENAME ${DATAROOT})
+    DIR_LIST=$($_LS ${SITEDATAROOT} | $_EGREP -v "^config$|^${MY_DIR}$|^lost\+found$")
+    for DIR in ${DIR_LIST} ; do
+        if [ -d "${SITEDATAROOT}/${DIR}/${DATE}" ] ; then
+            SERVER_DIR=$($_ECHO ${DIR} | $_AWK -F\_ '{print $1}')
+            TOR_HOSTS+=(${SERVER_DIR})
+        else
+            logWarning "DELTA: Directory not found ${SITEDATAROOT}/${DIR}/${DATE}"
+        fi
+    done
+
+    # Note: Due to the caching nature of NFS, these waits need to be longer then expected
+    # From the nfs man page
+    #  acdirmin=n    The  minimum  time  (in seconds) that the NFS client caches attributes of a directory before it requests fresh attribute
+    #                information from a server.  If this option is not specified, the NFS client uses a 30-second minimum.
+    # acdirmax=n     The maximum time (in seconds) that the NFS client caches attributes of a directory before it  requests  fresh  attribute
+    #                information from a server.  If this option is not specified, the NFS client uses a 60-second maximum.
+    SLEEP_TIME=30
+
+    # First we will wait up to 120 secs for the server to appear in the delta dir
+    MAX_WAIT_TIME=120
+    DELTA_ROOT=${DATAROOT}/${DATE}/delta
+    declare -a STARTED_HOSTS=()
+    declare -a HOSTS_TO_CHECK=()
+    declare -i WAIT_TIME=0
+    while [ ${#TOR_HOSTS[@]} -gt 0 ] && [ ${WAIT_TIME} -lt ${MAX_WAIT_TIME} ] ; do
+        $_SLEEP ${SLEEP_TIME}
+        let WAIT_TIME+=${SLEEP_TIME}
+
+        HOSTS_TO_CHECK=("${TOR_HOSTS[@]}")
+        TOR_HOSTS=()
+        for HOST in "${HOSTS_TO_CHECK[@]}"; do
+            if [ -d ${DELTA_ROOT}/${HOST} ] ; then
+                STARTED_HOSTS+=($HOST)
+            else
+                TOR_HOSTS+=($HOST)
+            fi
+        done
+    done
+
+    if [ ${#TOR_HOSTS[@]} -gt 0 ] ; then
+        logWarning "DELTA: Some hosts failed to start ${TOR_HOSTS[@]}"
+    fi
+
+    # Now we will wait up to 180 secs for the server to say it's done
+    MAX_WAIT_TIME=180
+    let WAIT_TIME=0
+    while [ ${#STARTED_HOSTS[@]} -gt 0 ] && [ ${WAIT_TIME} -lt ${MAX_WAIT_TIME} ] ; do
+        $_SLEEP ${SLEEP_TIME}
+        let WAIT_TIME+=${SLEEP_TIME}
+
+        HOSTS_TO_CHECK=("${STARTED_HOSTS[@]}")
+        STARTED_HOSTS=()
+        for HOST in "${HOSTS_TO_CHECK[@]}"; do
+            if [ -r ${DELTA_ROOT}/${HOST}/DONE ] ; then
+                $_RM -f ${DELTA_ROOT}/${HOST}/DONE
+            else
+                STARTED_HOSTS+=($HOST)
+            fi
+        done
+    done
+
+    if [ ${#STARTED_HOSTS[@]} -gt 0 ] ; then
+        logWarning "DELTA: Some hosts failed to complete ${STARTED_HOSTS[@]}"
+    fi
+}
+
+decrypt_password()
+{
+    PASSWORD_KEY_PREFIX="$1"
+    PASSKEY="$2"
+    GLOBAL_PROPERTIES="/ericsson/tor/data/global.properties"
+
+    for file in "${GLOBAL_PROPERTIES}" "${PASSKEY}"; do
+        if [ ! -f ${file} ]; then
+            logWarning "${file} does not exist - no attempt will be made to decrypt password"
+            return
+        fi
+    done
+
+    ENCRYPTED_PASSWORD=$(${_TIMEOUT} 5 ${_GREP} -i ${PASSWORD_KEY_PREFIX} ${GLOBAL_PROPERTIES} | ${_AWK} -F "${PASSWORD_KEY_PREFIX}" '{print $NF}')
+    DECRYPTED_PASSWORD=$(${_ECHO} "${ENCRYPTED_PASSWORD}" | ${_OSSL} enc -a -d -aes-128-cbc -kfile ${PASSKEY} 2> /dev/null)
+
+    if [ -z "${DECRYPTED_PASSWORD}" ]; then
+        logWarning "password was not retrieved correctly"
+    fi
+}
+
+get_pg_pass()
+{
+    if [ ! -z "${PG_PASS}" ]; then
+        return
+    fi
+
+    if [ -s /ericsson/enm/pg_utils/lib/pg_syslog_library.sh ] ; then
+        source /ericsson/enm/pg_utils/lib/pg_syslog_library.sh
+        source /ericsson/enm/pg_utils/lib/pg_password_library.sh
+
+        export_password
+        PG_PASS="${PGPASSWORD}"
+
+    else
+        PASSKEY="/ericsson/tor/data/idenmgmt/postgresql01_passkey"
+        PASSWORD_KEY_PREFIX="postgresql01_admin_password="
+
+        decrypt_password ${PASSWORD_KEY_PREFIX} ${PASSKEY}
+        PG_PASS="${DECRYPTED_PASSWORD}"
+    fi
+}
+
+checkPostgresAvailable() {
+    if [ ! -z "${POSTGRES_AVAILABLE}" ] ; then
+        return
+    fi
+
+    POSTGRES_AVAILABLE="no"
+
+    useRemoteServiceCollection
+    if [ "${USE_REMOTE_SERVICE_COLLECTION}" = "yes" ] ; then
+        POSTGRES_AVAILABLE="yes"
+    else
+        if [ ! -e /etc/init.d/postgresql01 ] ; then
+            return
+        fi
+
+        $_SERVICE postgresql01 status > /dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            return
+        fi
+
+        POSTGRES_AVAILABLE="yes"
+    fi
+}
+
+setPsqlBase() {
+    if [ ! -z "${PSQL_BASE}" ] ; then
+        return
+    fi
+
+    PSQL_BASE=""
+    for PSQL_PATH in /opt/rh/postgresql/bin/psql /usr/bin/psql ; do
+        if [ -x ${PSQL_PATH} ] ; then
+            PSQL_BASE="${PSQL_PATH}"
+        fi
+    done
+
+    if [ ! -z "${POSTGRES_SERVICE}" ] ; then
+        local PG_HOSTNAME="${POSTGRES_SERVICE}"
+    else
+        local PG_HOSTNAME=postgresql01
+    fi
+
+    if [ ! -z "${PSQL_BASE}" ] ; then
+        PSQL_BASE="${PSQL_BASE} --username postgres --host ${PG_HOSTNAME}"
+    fi
+}
+
+checkPostgresAvailableEsmon() {
+
+    if [ ! -d "/var/ericsson/esm_ddc_data" ] ; then
+        return
+    fi
+
+    if [ ! -z "${POSTGRES_AVAILABLE_ESMON}" ] ; then
+        return
+    fi
+    POSTGRES_AVAILABLE_ESMON="no"
+
+    if [ ! -e /etc/init.d/postgresql ] ; then
+        return
+    fi
+    $_SERVICE postgresql status > /dev/null 2>&1
+
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+    POSTGRES_AVAILABLE_ESMON="yes"
+}
+
+collectPostgresStats() {
+    # In cENM, Postgres stats are collected via Prometheus
+    if [ -r ${DATAROOT}/${DATE}/CLOUD_NATIVE ] ; then
+        return
+    fi
+
+    checkPostgresAvailable
+    checkPostgresAvailableEsmon
+    if [ "${POSTGRES_AVAILABLE}" != "yes" ] && [ "${POSTGRES_AVAILABLE_ESMON}" != "yes" ]; then
+        return
+    fi
+
+    get_pg_pass
+    setPsqlBase
+    if [ -z "${PSQL_BASE}" ] ; then
+        return
+    fi
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+    POSTGRES_OUTDIR=${CLUSTEREDDATA_DIR}/postgres
+    if [ ! -d ${POSTGRES_OUTDIR} ] ; then
+        mkdir -p ${POSTGRES_OUTDIR}
+    fi
+
+    if [ "${POSTGRES_AVAILABLE_ESMON}" == "yes" ]; then
+      FILENAME=esmon_postgres
+    else
+      FILENAME=postgres
+    fi
+
+    for TABLE in pg_stat_activity pg_stat_database ; do
+        $_ECHO "${TIMESTAMP}" >> ${POSTGRES_OUTDIR}/${FILENAME}.${TABLE}
+        PGPASSWORD=${PG_PASS} ${PSQL_BASE} -c "SELECT * FROM ${TABLE}" >> ${POSTGRES_OUTDIR}/${FILENAME}.${TABLE}
+    done
+}
+
+collectFLS() {
+
+    if [ ! -z "${FLS_RUNNING}" ] ; then
+        return
+    fi
+
+    FLS_RUNNING="yes"
+
+    TZ_FILE=$1
+
+    checkPostgresAvailable
+    if [ "${POSTGRES_AVAILABLE}" != "yes" ] ; then
+        return
+    fi
+
+    get_pg_pass
+    setPsqlBase
+    if [ -z "${PSQL_BASE}" ] ; then
+        return
+    fi
+
+    #
+    # We want the times in seconds since epoch (makes the processing
+    # faster if we don't have to convert all the times). However, the
+    # file_creationtime_in_oss, start_roptime_in_oss, and end_roptime_in_oss
+    # columns are 'timestamp without time zone'. So we have to specify the timezone
+    # to get postgres to do the conversion correctly
+    #
+    FLS_TIMEZONE=$($_CAT ${TZ_FILE} | $_AWK -F: '{print $1}')
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    FLS_DIR=${CLUSTEREDDATA_DIR}/fls
+    if [ ! -d ${FLS_DIR} ] ; then
+        $_MKDIR ${FLS_DIR}
+    fi
+
+    #
+    # In order to store the stats for the 15 minute File collection cycle that spans
+    # midnight (23:50->00:05), we need to collect from 23:50 yesterday
+    #
+    YESTERDAY=$(${_DATE} --date "${SQL_DATE_ONLY} -1 day" '+%Y-%m-%d')
+    DAY_START="${SQL_DATE_ONLY} 00:00:00"
+    if [ -r ${FLS_DIR}/lastid ] ; then
+        LAST_ID=$($_CAT ${FLS_DIR}/lastid)
+        if [ -z "${LAST_ID}" ] ; then
+            logWarning "collectFLS: Previous lastid in collectFLS is empty"
+            return
+        fi
+        WHERE="id > ${LAST_ID}"
+    else
+        FROM_TIME="${YESTERDAY} 23:50:00"
+        ${_ECHO} "${FROM_TIME}" > ${FLS_DIR}/from_time
+        WHERE="file_creationtime_in_oss >= '${FROM_TIME}'"
+    fi
+
+    PSQL="${PSQL_BASE} --dbname=flsdb --tuples-only --no-align"
+    # Get the id of the most recent entry in pm_rop_info
+    MAX_QUERY="SELECT MAX(id) FROM pm_rop_info WHERE ${WHERE} AND file_creationtime_in_oss < NOW() - INTERVAL '1 MINUTE'"
+    PGPASSWORD=${PG_PASS} ${PSQL} --command="${MAX_QUERY}" --output ${FLS_DIR}/maxid
+
+    if [ $? -ne 0 ] ; then
+        logError "ERROR: Failed to get last id from pm_rop_info"
+        return
+    fi
+    # Is the maxid valid
+    $_EGREP '^[0-9]+$' ${FLS_DIR}/maxid > /dev/null
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+    MAX_ID=$($_CAT ${FLS_DIR}/maxid)
+
+    WHERE="${WHERE} AND id <= ${MAX_ID}"
+
+    let INDEX=1
+    while [ -r ${FLS_DIR}/fls.log.${INDEX}.gz ] ; do
+        let INDEX=${INDEX}+1
+    done
+
+    logDebug "collectFLS: INDEX ${INDEX} WHERE ${WHERE}"
+
+    COLUMNS="node_name,node_type,data_type,file_type,file_size"
+    COLUMNS="${COLUMNS}, extract(epoch from file_creationtime_in_oss AT TIME ZONE '${FLS_TIMEZONE}') AS file_creationtime"
+    COLUMNS="${COLUMNS}, extract(epoch from start_roptime_in_oss AT TIME ZONE '${FLS_TIMEZONE}') AS rop_startime"
+    COLUMNS="${COLUMNS}, extract(epoch from end_roptime_in_oss  AT TIME ZONE '${FLS_TIMEZONE}') AS rop_endtime"
+    QUERY="SELECT ${COLUMNS} FROM pm_rop_info WHERE ${WHERE} ORDER BY id";
+    PGPASSWORD=${PG_PASS} ${PSQL} --command="${QUERY}" | $_GZIP -c > ${FLS_DIR}/.fls.log.${INDEX}.gz
+    if [ ${PIPESTATUS[0]} -eq 0 ] ; then
+        $_MV -f ${FLS_DIR}/maxid ${FLS_DIR}/lastid
+        ${_MV} ${FLS_DIR}/.fls.log.${INDEX}.gz ${FLS_DIR}/fls.log.${INDEX}.gz
+    else
+        logError "ERROR: Failed to get fls data"
+        ${RM} -f ${FLS_DIR}/maxid ${FLS_DIR}/.fls.log.${INDEX}.gz
+    fi
+}
+
+checkElasticSearchAvailable() {
+    if [ ! -z "${ELASTICSEARCH_AVAILABLE}" ] ; then
+        return
+    fi
+
+    ELASTICSEARCH_AVAILABLE="no"
+    CORE_COLLECTING_ELASTICSEARCH="no"
+    if [ -r ${SITEDATAROOT}/config/DISABLE_ELASTICSEARCH ] ; then
+        return
+    fi
+
+    useRemoteServiceCollection
+    # If ELASTICSEARCH_URL is set, then Elasticsearch is being handled in ERICddc-core
+    if [ "${USE_REMOTE_SERVICE_COLLECTION}" = "yes" ] ; then
+        ELASTICSEARCH_AVAILABLE="yes"
+        if [ ! -z "${ELASTICSEARCH_URL}" ] ; then
+            CORE_COLLECTING_ELASTICSEARCH="yes"
+        fi
+    elif [ -e /etc/init.d/elasticsearch ] ; then
+        $_SERVICE elasticsearch status > /dev/null 2>&1
+        if [ $? -ne 0 ]  ; then
+            return
+        fi
+
+        ELASTICSEARCH_AVAILABLE="yes"
+    fi
+}
+
+collectElasticSearchStats() {
+    checkElasticSearchAvailable
+    if [ "${ELASTICSEARCH_AVAILABLE}" = "no" ] || [ "${CORE_COLLECTING_ELASTICSEARCH}" = "yes" ] ; then
+        return
+    fi
+
+    $_ECHO "${TIMESTAMP}" >> ${OUTPUT_DIR}/elasticsearch.stats # Write timestamp to file
+    ${DDCDIR}/monitor/common/scripts/getlog.py --action get_stats --esurl http://elasticsearch:9200 >> ${OUTPUT_DIR}/elasticsearch.stats
+}
+
+checkEshistoryAvailable(){
+   if [ ! -z "${ESHISTORY_AVAILABLE}" ] ; then
+        return
+   fi
+
+   ESHISTORY_AVAILABLE="no"
+   ESHISTORY_PORT=8900
+
+   useRemoteServiceCollection
+   if [ "${USE_REMOTE_SERVICE_COLLECTION}" = "yes" ] ; then
+        ESHISTORY_AVAILABLE="yes"
+        ESHISTORY_PORT=9200
+   elif [ -e /etc/init.d/eshistory ] ; then
+        $_SERVICE eshistory status > /dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            return
+        fi
+
+        ESHISTORY_AVAILABLE="yes"
+   fi
+}
+
+collectEshistoryStats() {
+  checkEshistoryAvailable
+  if [ "${ESHISTORY_AVAILABLE}" = "no" ] ; then
+      return
+  fi
+
+  $_ECHO "${TIMESTAMP}" >> ${OUTPUT_DIR}/eshistory.stats
+  ${DDCDIR}/monitor/common/scripts/getlog.py --action get_stats --esurl http://eshistory:${ESHISTORY_PORT} >> ${OUTPUT_DIR}/eshistory.stats
+
+  initClusterDataDir
+  if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+      return
+  fi
+
+  logDebug "Collecting ES history indices"
+  ESHISTORY_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/eshistory
+
+  if [ ! -d ${ESHISTORY_CLUSTERED_DIR} ] ; then
+     if ! $_MKDIR -p ${ESHISTORY_CLUSTERED_DIR} ; then
+         logError "Failed to create directory ${ESHISTORY_CLUSTERED_DIR}. No ES history logs will be collected"
+         return 1
+     fi
+  fi
+  $_ECHO "${TIMESTAMP}" >> ${ESHISTORY_CLUSTERED_DIR}/es_history_indices.log
+  curl -s 'eshistory:'${ESHISTORY_PORT}'/_cat/indices' --max-time 300 >> ${ESHISTORY_CLUSTERED_DIR}/es_history_indices.log
+}
+
+collectSystemLogs() {
+    checkElasticSearchAvailable
+    if [ "${ELASTICSEARCH_AVAILABLE}" = "no" ] ; then
+        return
+    fi
+
+    # Collect the elasticsearch logs into 'elasticsearch' folder under 'clustered_data' directory
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    ELASTICSEARCH_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/elasticsearch
+    if [ ! -d ${ELASTICSEARCH_CLUSTERED_DIR} ] ; then
+        if ! $_MKDIR -p ${ELASTICSEARCH_CLUSTERED_DIR} ; then
+            logError "Failed to create directory ${ELASTICSEARCH_CLUSTERED_DIR}. No Elasticsearch logs will be collected"
+            return 1
+        fi
+    fi
+
+    if [ "${CORE_COLLECTING_ELASTICSEARCH}" = "no" ] ; then
+        logDebug "Collecting ES indices"
+        curl -s 'elasticsearch:9200/_cat/indices' > ${ELASTICSEARCH_CLUSTERED_DIR}/ES_indices.log
+    fi
+
+    # Default to 1GB limit
+    MAX_ELASTICSEARCH_SIZE=1073741824
+    # See if some default has been overridden
+    if [ -r ${SITEDATAROOT}/config/MAX_ELASTICSEARCH_SIZE ] ; then
+        MAX_ELASTICSEARCH_SIZE=$($_CAT ${SITEDATAROOT}/config/MAX_ELASTICSEARCH_SIZE)
+    else
+        # Check if we're on a small file system (less then 10GB)
+        DISK_SPACE_TOTAL_KB=$($_DF -kP ${SITEDATAROOT} | $_GREP ${SITEDATAROOT} | $_AWK '{print $2}')
+        if [ ${DISK_SPACE_TOTAL_KB} -lt 10485760 ] ; then
+            # For non-standard 5G DDC volumes use a lower threshold for ES log size
+            MAX_ELASTICSEARCH_SIZE=268435456
+        fi
+    fi
+
+    # Define 'getlog' and 'flock' input options for the given ${TASK}
+    if [ "${TASK}" = "TRIGGER" ] || [ "${TASK}" = "MAKETAR" ] ; then
+        MAX_TIME_THRESHOLD=300
+        # If 'getlog' is already running for the given date then skip log collection during TRIGGER
+        #  But wait for 6 min to get the previous 'getlog' over during MAKETAR
+        FLOCK_OPTIONS="-n"
+        if [ "${TASK}" = "MAKETAR" ] ; then
+            FLOCK_OPTIONS="-w 360"
+        fi
+    elif [ "${TASK}" = "STOP" ] ; then
+        MAX_TIME_THRESHOLD=900
+        # Wait for 6 min to get any previously running 'getlog' over during STOP
+        FLOCK_OPTIONS="-w 360"
+    fi
+
+    # Get the Elasticsearch latency in seconds configured under the file
+    #  '/var/ericsson/ddc_data/config/ELASTICSEARCH_LATENCY'. Otherwise use 300 sec default latency
+    ES_LATENCY=300
+    if [ -r ${SITEDATAROOT}/config/ELASTICSEARCH_LATENCY ] ; then
+        ES_LATENCY=$($_CAT ${SITEDATAROOT}/config/ELASTICSEARCH_LATENCY | $_EGREP -v "^\s*#|^\s*$" | $_HEAD -n 1)
+    fi
+
+    if [ "${TASK}" == "STOP" ] ; then
+        $_SLEEP ${ES_LATENCY}
+        ES_LATENCY=0
+    fi
+
+    if [ -z "${ELASTICSEARCH_INDEX_TEMPLATE}" ] ; then
+        local ELASTICSEARCH_INDEX_TEMPLATE="enm_logs-application-%Y.%m.%d"
+    fi
+    local ELASTICSEARCH_INDEX=$(${_DATE} --date "${SQL_DATE_ONLY}" "+${ELASTICSEARCH_INDEX_TEMPLATE}")
+
+    if [ "${CORE_COLLECTING_ELASTICSEARCH}" = "yes" ] ; then
+        LOG_TYPE_LIST="data"
+    else
+        setConfigValue DISABLE_COLLECT_ES_ALL "no"
+        if [ "${DISABLE_COLLECT_ES_ALL}" = "yes" ] ; then
+            LOG_TYPE_LIST="data"
+        else
+            LOG_TYPE_LIST="all data"
+        fi
+    fi
+    for LOG_TYPE in ${LOG_TYPE_LIST} ; do
+        if [ "${LOG_TYPE}" = "all" ] ; then
+            local OPTION="read_log"
+            local FILE="elasticsearch.log.gz"
+            local INCR="elasticsearch.incr"
+            local FIELDS="timestamp,host,program,severity,message"
+        else
+            local OPTION="read_data"
+            local FILE="eventdata.log.gz"
+            local INCR="eventdata.incr"
+            local FIELDS="timestamp,host,program,message"
+        fi
+
+        # Execute 'getlog' script, via 'flock' tool, to collect Elasticsearch logs
+        GETLOG_COMMAND=$(printf "${DDCDIR}/monitor/common/scripts/getlog.py --esurl http://elasticsearch:9200 --action %s --fields %s --index %s --date %s --output %s --incr %s --maxtime %d --maxsize %d %s" \
+                                ${OPTION} ${FIELDS} ${ELASTICSEARCH_INDEX} ${SQL_DATE_ONLY} ${ELASTICSEARCH_CLUSTERED_DIR}/${FILE} \
+                                ${ELASTICSEARCH_CLUSTERED_DIR}/${INCR} ${MAX_TIME_THRESHOLD} \
+                                ${MAX_ELASTICSEARCH_SIZE} "${ES_LATENCY_ARG}")
+        if [ ${ES_LATENCY} -gt 0 ] ; then
+            GETLOG_COMMAND="${GETLOG_COMMAND} --latency ${ES_LATENCY}"
+        fi
+
+        GETLOG_LOCK_FILE="/var/lock/getlog_${SQL_DATE_ONLY}"
+        logDebug "Starting to execute 'getlog' to collect Elasticsearch logs: $_FLOCK ${FLOCK_OPTIONS} ${GETLOG_LOCK_FILE} -c \"${GETLOG_COMMAND}\""
+        $_FLOCK ${FLOCK_OPTIONS} ${GETLOG_LOCK_FILE} -c "${GETLOG_COMMAND}"
+        if [ $? -eq 1 ] ; then
+            logWarning "An instance of 'getlog' is already running. No Elasticsearch logs will be collected in this ${TASK}"
+        fi
+    done
+
+    # Remove older 'getlog' lock files
+    if [ "${TASK}" = "STOP" ] ; then
+        $_FIND /var/lock/ -maxdepth 1 -mtime +1 -name "getlog_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" -delete
+    fi
+}
+
+collectVersantSpaceInfo() {
+    initVersantVariables
+    if [ "${VERSANT_RUNNING}" != "yes" ] ; then
+        return
+    fi
+
+    if [ -z "${VERSANT_LOG_DIR}" ] ; then
+        return
+    fi
+
+    logDebug "Collecting Versant Space Information"
+    # Connect to ENM Versant DB and extract the space information per volume
+    $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/dbtool -nosession -space -volume -all -verbose ${ENM_VERSANT_DB}" > ${VERSANT_LOG_DIR}/${ENM_VERSANT_DB}.${VERSANT_DB_SPACE_LOG}
+}
+
+collectOpenAlarmCount() {
+    initVersantVariables
+    if [ "${VERSANT_RUNNING}" = "yes" ] ; then
+        if [ -z "${VERSANT_LOG_DIR}" ] ; then
+            return
+        fi
+
+        COUNT=$($_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} ns_FM.Pt_OpenAlarm" | $_GREP -w Total | $_AWK '{print $3}')
+        $_ECHO "${TIMESTAMP} ${COUNT}" >> ${VERSANT_LOG_DIR}/OpenAlarmCount.txt
+    else
+        initNeo4jVariables
+        if [ "${NEO4J_RUNNING}" = "yes" ] ; then
+            if [ "${NEO4J_HAS_CAUSAL_CLUSTER}" = "yes" ] && [ "${NEO4J_HAS_CAUSAL_ROLE}" != "leader" ] ; then
+                return
+            fi
+            COUNT=$(${QUERY_NEO4J} --action alarms_open_count)
+            $_ECHO "${TIMESTAMP} ${COUNT}" >> ${NEO4J_DIR}/OpenAlarmCount.txt
+        fi
+    fi
+}
+
+collectVersantLogs(){
+    initVersantVariables
+    if [ "${VERSANT_RUNNING}" != "yes" ] ; then
+        return
+    fi
+
+    if [ -z "${VERSANT_LOG_DIR}" ] ; then
+        return
+    fi
+
+    logDebug "Collecting Versant Logs"
+
+    # Collect object count
+    # Connect to ENM Versant DB and extract the occurrence count and name of each object per class
+    # We collect the live and non-live at the same time to get a consistent picture
+    if [ ! -r ${VERSANT_LOG_DIR}/nonlive.counts ] ; then
+        $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} | $_EGREP '^\*+ ' | $_AWK '{print \$3 \" \" \$7}'" > ${VERSANT_LOG_DIR}/${ENM_VERSANT_DB}.${VERSANT_OBJECT_COUNT_LOG}
+        ${UTILDIR}/bin/countNonLive > ${VERSANT_LOG_DIR}/nonlive.counts 2>&1
+    fi
+
+    # Collect Versant Crash Info
+    logInfo "Collecting Versant Crash Info"
+    ${_LS} -la --time-style=+"%Y-%m-%d %H:%M:%S" ${ENM_VERSANTCRASH_DIR} | ${_GREP} "${SQL_DATE_ONLY} *[0-9][0-9]:[0-9][0-9]" > ${VERSANT_LOG_DIR}/dps_integration.ls_la
+
+    # Collect MO instances
+    if [ ! -d ${VERSANT_LOG_DIR}/mo ] ; then
+        ${_MKDIR} ${VERSANT_LOG_DIR}/mo
+    fi
+    $_CAT > ${VERSANT_LOG_DIR}/mofilter.awk <<'EOF'
+BEGIN {
+    inAtList = 0
+}
+
+{
+    if (inAtList || ($2 ~ /^L$|^fdn$|^at_|Time$|^bucketName$/)) {
+        print $0;
+    }
+    if ( (inAtList == 0) && ($2 ~ /^at_/) && ($3 ~ /^<list>$/) ) {
+        inAtList = 1;
+    } else if ( (inAtList == 1) && ($2 !~ /^item:/) ) {
+        inAtList = 0;
+    }
+}
+EOF
+    MO_TYPE_LIST="ns_CM.Pt_InventorySupervision ns_CPP_MED.Pt_CppConnectivityInformation ns_NodeDiscovery.Pt_NodeDiscoverySupervision"
+    MO_TYPE_LIST="${MO_TYPE_LIST} ns_OSS_NE_CM_DEF.Pt_CmFunction ns_OSS_NE_CM_DEF.Pt_CmNodeHeartbeatSupervision "
+    MO_TYPE_LIST="${MO_TYPE_LIST} ns_OSS_NE_DEF.Pt_NetworkElement ns_OSS_NE_FM_DEF.Pt_FmAlarmSupervision ns_OSS_NE_FM_DEF.Pt_FmFunction"
+    MO_TYPE_LIST="${MO_TYPE_LIST} ns_OSS_NE_SEC_DEF.Pt_NetworkElementSecurity ns_OSS_NE_SHM_DEF.Pt_InventoryFunction ns_OSS_TOP.Pt_MeContext"
+    MO_TYPE_LIST="${MO_TYPE_LIST} ns_COM_MED.Pt_ComConnectivityInformation"
+    MO_TYPE_LIST="${MO_TYPE_LIST} ns_OSS_NE_PM_DEF.Pt_PmFunction"
+    for MO_TYPE in ${MO_TYPE_LIST} ; do
+        $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} -i ${MO_TYPE}" | \
+            $_AWK -f ${VERSANT_LOG_DIR}/mofilter.awk > ${VERSANT_LOG_DIR}/mo/${MO_TYPE}
+    done
+    ${_RM} ${VERSANT_LOG_DIR}/mofilter.awk
+
+    # Collect PMIC DB info
+    if [ ! -d ${VERSANT_LOG_DIR}/pmic ] ; then
+        ${_MKDIR} ${VERSANT_LOG_DIR}/pmic
+    fi
+    $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} -i -v ns_pmic_subscription.Pt_Subscription" > ${VERSANT_LOG_DIR}/pmic/Subscription
+    for CLASS in EventInfo ; do
+        $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} -i ns_pmic_event_subscription.Et_${CLASS}" > ${VERSANT_LOG_DIR}/pmic/${CLASS}
+    done
+    for CLASS in CounterInfo ; do
+        $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} -i ns_pmic_stat_subscription.Et_${CLASS}" > ${VERSANT_LOG_DIR}/pmic/${CLASS}
+    done
+    $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/db2tty -D ${ENM_VERSANT_DB} -i ns_pmic_subscription.Pt_PMICScannerInfo" | \
+        $_AWK '{if ($2 ~ /^fdn$|^at_|Time$|^bucketName$/) {print $0}}' | \
+        $_EGREP -v '#null|at_name|at_nodeName'> ${VERSANT_LOG_DIR}/pmic/PMICScannerInfo
+
+    # Collect NE Type Information
+    logInfo "Collecting NE Type Information"
+    NEINFO="${VERSANT_LOG_DIR}/nodeInfo.txt"
+    $_SU - ${VERSANT_USER} --command "$VERSANT_BIN_DIR/db2tty -i -d dps_integration ns_OSS_NE_DEF.Pt_NetworkElement|$_EGREP -i 'at_ossModelIdentity|at_neType'" > ${NEINFO}
+    modelId=$($_GREP "^##.*at_ossModelIdentity" ${NEINFO} | $_AWK -F '[""]' '{print $2}' | $_SORT -u)
+    [ -f  ${VERSANT_LOG_DIR}/neTypeInfo.txt ] && $_RM -f ${VERSANT_LOG_DIR}/neTypeInfo.txt
+    for omid in $modelId ; do
+        XML_LIST=$($_GREP "ossModelIdentity\=\"$omid\"" /etc/opt/ericsson/ERICmodeldeployment/models/etc/model/*/ned_netypeinfo/*/*.xml | $_SED 's/:.*//')
+        for XML in $XML_LIST ; do
+            NODE_TYPE=$($_GREP neType $XML | $_GREP -o -P '(?<=neType ).*(?=</ns)')
+            MODEL_ID=$($_GREP ossModelIdentity $XML | $_AWK -F '[""]' '{print $2}')
+            RELEASE=$($_GREP release $XML)
+            XMLFILE=$($_GREP "cfm_miminfo" $XML | $_AWK -F/ '{print $(NF-1)}' | $_SED 's/<.*$//')
+            PARENT_PATH="/etc/opt/ericsson/ERICmodeldeployment/models/etc/model/*/cfm_miminfo/${NODE_TYPE}/NE-defined/NE-defined-"
+            for FILE in $XMLFILE ; do
+                VERSION_FILES=$PARENT_PATH$FILE\.xml
+                for VERSION_FILE in $VERSION_FILES ; do
+                    if [ -f $VERSION_FILE ]; then
+                        MIM_NAMES=$($_GREP "mimMappedTo" $VERSION_FILE)
+                        $_ECHO $RELEASE@$MIM_NAMES@$MODEL_ID >> ${VERSANT_LOG_DIR}/neTypeInfo.txt
+                    fi
+                done
+            done
+        done
+    done
+
+    # Collect DB ID
+    $_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/dbtool -nosession -AT -info -rootpages dps_integration" > ${VERSANT_LOG_DIR}/dps_integration.at_info_rootpages 2>&1
+
+    # Collect DB log file
+    DBFOLDER=$($_SU - ${VERSANT_USER} --command "${VERSANT_BIN_DIR}/oscp -d")
+    DBNAME=$($_SU - ${VERSANT_USER} --command ${VERSANT_BIN_DIR}/dblist | $_GREP "DB name" | $_CUT -d"=" -f2 | $_CUT -d"@" -f1 | $_SED 's/^ *//g')
+    CURRENTDATE="${MONTH_DAY_BP}"
+    NEXTDATE=$($_DATE --date "${SQL_DATE_ONLY} +1 day" "+%b %e")
+    if [[ -f ${DBFOLDER}/${DBNAME}/LOGFILE ]] ; then
+        $_CAT ${DBFOLDER}/${DBNAME}/LOGFILE | $_SED -n "/${CURRENTDATE}/,/${NEXTDATE}/p" > ${VERSANT_LOG_DIR}/${DBNAME}.LOGFILE
+    else
+        logDebug "Unable to find LOGFILE"
+    fi
+}
+
+initClusterDataDir() {
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        if [ -r ${SITEDATAROOT}/config/DDC_MASTER_DIR ] ; then
+            DDC_MASTER_DIR=$($_CAT ${SITEDATAROOT}/config/DDC_MASTER_DIR)
+            MSDATAROOT=${SITEDATAROOT}/${DDC_MASTER_DIR}
+        else
+            # First, try to get MS root directory path from 'MS_DATA_ROOT_${DATE}' file
+            logInfo "Trying to get MS root directory path from 'MS_DATA_ROOT_${DATE}' file"
+            MSDATAROOT=$(cat ${SITEDATAROOT}/config/MS_DATA_ROOT_${DATE} | $_SED -e 's/^[ \t]*//' -e 's/[ \t]*$//')
+
+            # If we still don't have the MS root directory path then try the hard way
+            if [ -z "${MSDATAROOT}" ] ; then
+                logInfo "Unable to get MS root directory from 'MS_DATA_ROOT_${DATE}'. Trying the hard way now"
+                BASE_DATAROOT_ICDD="$($_DIRNAME ${DATAROOT})"
+                TOR_HOSTS_ICDD=$($_LS ${BASE_DATAROOT_ICDD} | $_GREP _[A-Z][A-Z]*$)
+                for TOR_HOST_ICDD in ${TOR_HOSTS_ICDD} ; do
+                    if [ -r ${BASE_DATAROOT_ICDD}/${TOR_HOST_ICDD}/${DATE}/DDC_MASTER ] ||
+                           [ -d ${BASE_DATAROOT_ICDD}/${TOR_HOST_ICDD}/${DATE}/TOR/${CLUSTEREDDATA} ] ; then
+                        MSDATAROOT="${BASE_DATAROOT_ICDD}/${TOR_HOST_ICDD}"
+                        break
+                    fi
+                done
+            fi
+        fi
+
+        # If we got MS root directory path then initialize clustered data directory and
+        # return '0'. Otherwise, just return '1'
+        if [ -z "${MSDATAROOT}" ] ; then
+            logWarning "Unable to get the path to MS root directory. Failed to initialize clustered data directory"
+            return 1
+        else
+            logInfo "Retrieved the path to MS root directory as '${MSDATAROOT}'"
+            CLUSTEREDDATA_DIR="${MSDATAROOT}/${DATE}/TOR/${CLUSTEREDDATA}"
+            if [ ! -d ${CLUSTEREDDATA_DIR} ] ; then
+                $_MKDIR -p ${CLUSTEREDDATA_DIR}
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+initVersantVariables() {
+    if [ -z "${VERSANT_RUNNING}" ] ; then
+        VERSANT_RUNNING="no"
+
+        VERSANT_BIN_DIR="/ericsson/versant/bin"
+        if [ ! -x ${VERSANT_BIN_DIR}/db2tty ] ; then
+            return
+        fi
+
+        VERSANT_USER="versant"
+        /usr/bin/pgrep -u ${VERSANT_USER} "obe|vserver" > /dev/null
+        if [ $? -ne 0 ] ; then
+            return
+        fi
+
+        VERSANT_RUNNING="yes"
+
+        ENM_VERSANT_DB="dps_integration"
+        VERSANT_OBJECT_COUNT_LOG="object_count"
+        VERSANT_DB_SPACE_LOG="db_space"
+        ENM_VERSANTCRASH_DIR="/ericsson/versant_data/databases/dps_integration"
+    fi
+
+    if [ -z "${VERSANT_LOG_DIR}" ] ; then
+        VERSANT_LOG_DIR=""
+        initClusterDataDir
+        if [ ! -z "${CLUSTEREDDATA_DIR}" ] ; then
+            VERSANT_LOG_DIR="${CLUSTEREDDATA_DIR}/versant"
+            if [ ! -d ${VERSANT_LOG_DIR} ] ; then
+                $_MKDIR ${VERSANT_LOG_DIR}
+            fi
+        fi
+    fi
+}
+
+initHaclusList() {
+    if [ -x ${_HACLUS} ] ; then
+        HACLUS_LIST=$($_HACLUS -list)
+    fi
+}
+
+collectVcsInfo() {
+    local ENGINE_LOG_DIR=/var/VRTSvcs/log
+    if [ -x ${_HAALERT} ] ; then
+        $_HAALERT -list > ${OUTPUT_DIR}/vcs/haalert.log
+    fi
+
+    initHaclusList
+    if [ ! -z "${HACLUS_LIST}" ] ; then
+        echo "${HACLUS_LIST}" >  ${OUTPUT_DIR}/vcs/hacluslist.log
+    fi
+
+    if [ -r ${ENGINE_LOG_DIR}/engine_A.log ] ; then
+        $_LS -r ${ENGINE_LOG_DIR}/engine_[A-Z]*.log | $_XARGS -I{} $_GREP $($_DATE --date "${SQL_DATE_ONLY}" +%Y/%m/%d) -A 999999 {} > ${OUTPUT_DIR}/vcs/engine_A.log
+    fi
+}
+
+collectVappGatewayHostname() {
+    if [ -x ${_VIRTWHAT} ] && [ "$($_VIRTWHAT)" == "vmware" ] ; then
+        echo $($_CURL -s -k https://atvpcspp12.athtem.eei.ericsson.se/Vms/gateway_hostname) > ${OUTPUT_DIR}/gateway_hostname
+    fi
+}
+
+collectJGroupsStats() {
+    if [ "${SERVICE_GROUP}" != "medrouter" ] ; then
+        return
+    fi
+
+    # We only want to collect this from the first medrouter VM
+    isSgInstance medrouter 1
+    if [ "${IS_SG_INST_RESULT}" = "true" ] ; then
+        $_ECHO "BEGIN ${TIMESTAMP}" >> ${OUTPUT_DIR}/jgroup_udp.stats # Write timestamp to file
+        JGROUP_DEV=$($_EGREP '^jgroups_bind_nic' /ericsson/tor/data/global.properties | $_AWK -F= '{print $2}')
+        JGROUP_DEV_IP_ADDR=$(/sbin/ip -6 addr show dev ${JGROUP_DEV} | $_GREP inet6 | $_AWK '{print $2}' | $_SED 's|/64||')
+
+        local QUERY="jmx=UDP.num"
+        $_EGREP --silent '^gossiprouter' /ericsson/tor/data/global.properties
+
+        if [ $? -eq 0 ] ; then
+            QUERY="${QUERY} jmx=TCP.num"
+        fi
+
+        JGROUP_SUB_DIR=com/ericsson/oss/itpf/sdk/infinispan/8.2.11.Final
+        if [ -d /ericsson/3pp/jboss/modules/system/layers/base/${JGROUP_SUB_DIR} ]; then
+            local JGROUP_JAR_DIR=/ericsson/3pp/jboss/modules/system/layers/base/${JGROUP_SUB_DIR}
+        else
+            local JGROUP_JAR_DIR=/opt/ericsson/jboss/modules-sfwk/${JGROUP_SUB_DIR}
+        fi
+        local JGROUP_JAR_PATH=$($_FIND ${JGROUP_JAR_DIR} -name "jgroups-*.jar" | $_EGREP -v 'sources|javadoc' | $_HEAD -1)
+        /usr/java/default/bin/java -Xmx128m -cp ${JGROUP_JAR_PATH} org.jgroups.tests.Probe -bind_addr ${JGROUP_DEV_IP_ADDR} -weed_out_duplicates --query ${QUERY} >> ${OUTPUT_DIR}/jgroup_udp.stats
+    fi
+}
+
+collectConfigListing() {
+    CONFIG_DUMP_DIR="${SITEDATAROOT}/config/"
+
+    logInfo "Collecting config Dump Info"
+    if [ -d "${CONFIG_DUMP_DIR}" ] ; then
+        ${_LS} --full ${CONFIG_DUMP_DIR} >> ${CONFIG_DUMP_DIR}/configListing.txt
+    else
+        logDebug "$CONFIG_DUMP_DIR not available"
+    fi
+}
+
+collectEnmDumpFileInfo() {
+    ENM_DUMP_DIR="/ericsson/enm/dumps";
+    FMX_DUMPFILE_PATH="${ENM_DUMP_DIR}/fmx/"
+    VERSANT_DUMPFILE_PATH="${ENM_DUMP_DIR}/versant"
+    NEO4J_DUMPFILE_PATH="${ENM_DUMP_DIR}/neo4j"
+
+    logInfo "Collecting ENM Dump Info"
+    if [ -d "${ENM_DUMP_DIR}" ] ; then
+        ${_LS} --full ${ENM_DUMP_DIR} > ${OUTPUT_DIR}/dumps
+    else
+        logDebug "$ENM_DUMP_DIR not available"
+    fi
+    logInfo "Collecting FMX Dump File list"
+    if [ -d "${FMX_DUMPFILE_PATH}" ] ; then
+        ${_LS} --full ${FMX_DUMPFILE_PATH} >> ${OUTPUT_DIR}/dumps
+    else
+        logDebug "$FMX_DUMPFILE_PATH directory not available"
+    fi
+    logInfo "Collecting VERSANT Dump File list"
+    if [ -d "${VERSANT_DUMPFILE_PATH}" ] ; then
+        ${_LS} --full ${VERSANT_DUMPFILE_PATH} >> ${OUTPUT_DIR}/dumps
+    else
+        logDebug "${VERSANT_DUMPFILE_PATH} directory not available"
+        logInfo "Collecting NEO4J Dump File list"
+        if [ -d "${NEO4J_DUMPFILE_PATH}" ] ; then
+            ${_LS} --full ${NEO4J_DUMPFILE_PATH} >> ${OUTPUT_DIR}/dumps
+        else
+            logDebug "${NEO4J_DUMPFILE_PATH} directory not available"
+        fi
+    fi
+}
+
+collectBurLogs () {
+    #FILE_INFO {filename:"bur/measurement_backup_FilesystemThroughput.data", Description:"Data copied from /opt/ericsson/itpf/bur/data/measurement_backup_FilesystemThroughput.data", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/measurement_restore_FilesystemThroughput.data", Description:"Data copied from /opt/ericsson/itpf/bur/data/measurement_restore_FilesystemThroughput.data", privacy_content:["Unknown"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/backup_logs/clean_backup.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/backup_logs/clean_backup.log", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/bos/bos.log[.\d]*", Description:"Data copied from /opt/ericsson/itpf/bur/log/bos/bos.log[.\d]*", privacy_content:["IP_Address"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/brs/brs.log[.\d]*", Description:"Data copied from /opt/ericsson/itpf/bur/log/brs/brs.log[.\d]*", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/brs/supervisor.log[.\d]*", Description:"Data copied from /opt/ericsson/itpf/bur/log/brs/supervisor.log[.\d]*", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/snapshot_logs/manage_enm_lvm_snapshot.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/snapshot_logs/manage_enm_lvm_snapshot.log", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/usr/openv/netbackup/logs/ombs/data/bpend_notify_log_ENM_SCHEDULED_.*-bkp\d+", Description:"Data copied from /usr/openv/netbackup/logs/ombs/data/bpend_notify_log_ENM_SCHEDULED_.*-bkp\d+", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/usr/openv/netbackup/logs/ombs/data/bpstart_notify_log_ENM_SCHEDULED_.*-bkp\d+", Description:"Data copied from /usr/openv/netbackup/logs/ombs/data/bpstart_notify_log_ENM_SCHEDULED_.*-bkp\d+", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/usr/openv/netbackup/logs/ombs/data/trace_logs/_trace_.*-bkp\d+_ENM_SCHEDULED_.*-bkp\d+/_stream_", Description:"Data copied from /usr/openv/netbackup/logs/ombs/data/trace_logs/_trace_.*-bkp\d+_ENM_SCHEDULED_.*-bkp\d+/_stream_", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/ois/nbu_client_installer.[\d\.-]+.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/ois/nbu_client_installer.[\d\.-]+.log", privacy_content:["IP_Address"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/ros/ROS.[\d\.-]+.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/ros/ROS.[\d\.-]+.log", privacy_content:["None"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/vrts/vrts_debug_files_removal.[\d\.-]+.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/vrts/vrts_debug_files_removal.[\d\.-]+.log", privacy_content:["IP_Address"]}
+    #FILE_INFO {filename:"bur/opt/ericsson/itpf/bur/log/vrts/remove_vrts_debug_files.[\d\.-]+.log", Description:"Data copied from /opt/ericsson/itpf/bur/log/vrts/remove_vrts_debug_files.[\d\.-]+.log", privacy_content:["None"]}
+
+    logInfo "Collecting Bur Logs"
+
+    BUR_DIR_CFG="${TOR_MONITORDIR}/config/burLogFormat.cfg"
+    DEST_DIR="${OUTPUT_DIR}/../bur/"
+    BUR_DIR_LIST=$($_SED -e 's/#.*$//' -e '/^[[:space:]]*$/d' ${BUR_DIR_CFG} | $_AWK -F: '{ print $2 }')
+
+    for burdir in ${BUR_DIR_LIST}
+    do
+        if [ -d ${burdir} ] ; then
+
+            DIR_LIST=$(${_FIND} ${burdir} -type d)
+
+            for dir in ${DIR_LIST}
+            do
+                ${_MKDIR} -p ${DEST_DIR}/${dir}
+            done
+
+            FILE_LIST=$(${_FIND} ${burdir} -type f)
+
+            for file in ${FILE_LIST}
+            do
+                if [ -s ${file} ] ; then
+                    ${_CAT} ${file} | ${_GREP} "${SQL_DATE_ONLY}" > ${DEST_DIR}/${file}
+
+                    if [ ! -s ${DEST_DIR}/${file} ] ; then
+                        ${_CAT} ${file} | ${_GREP} "${YEAR_MON_DAY}" >> ${DEST_DIR}/${file}
+                        [ ! -s ${DEST_DIR}/${file} ] && ${_RM} ${DEST_DIR}/${file}
+                    fi
+                fi
+
+            done
+        fi
+   done
+
+   THROUGHPUT_DIR="/opt/ericsson/itpf/bur/data"
+   FILE_LIST="${THROUGHPUT_DIR}/measurement_backup_FilesystemThroughput.data ${THROUGHPUT_DIR}/measurement_restore_FilesystemThroughput.data"
+
+   for FILE in ${FILE_LIST}
+   do
+       if [ -s ${FILE} ] && [ -r ${FILE} ] ; then
+           $_CP ${FILE} ${DEST_DIR}
+       fi
+   done
+}
+
+collectConfigLVS() {
+    if [ -z "${SERVICE_GROUP}" ] ; then
+        return
+    fi
+    $_ECHO "${SERVICE_GROUP}" | $_EGREP 'lvsrouter$' > /dev/null
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+
+    if [ ! -d ${OUTPUT_DIR}/lvs ] ; then
+        ${_MKDIR} ${OUTPUT_DIR}/lvs
+    fi
+
+    $_CP -f /etc/hosts ${OUTPUT_DIR}/lvs/hosts
+}
+
+collectStatsLVS() {
+    if [ -z "${SERVICE_GROUP}" ] ; then
+        return
+    fi
+    $_ECHO "${SERVICE_GROUP}" | $_EGREP 'lvsrouter$' > /dev/null
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+
+    logInfo "collectStatsLVS Starting"
+
+    if [ ! -d ${OUTPUT_DIR}/lvs ] ; then
+        ${_MKDIR} ${OUTPUT_DIR}/lvs
+    fi
+
+    $_ECHO "BEGIN ${TIMESTAMP}" >> ${OUTPUT_DIR}/lvs/ipvsadm.log
+    /sbin/ipvsadm --list --numeric --exact 2>&1 | $_TEE -a ${OUTPUT_DIR}/lvs/ipvsadm.log > /dev/null
+
+    $_ECHO "BEGIN ${TIMESTAMP}" >> ${OUTPUT_DIR}/lvs/ipvsadm_stats.log
+    /sbin/ipvsadm --list --numeric --stats --exact 2>&1 | $_TEE -a ${OUTPUT_DIR}/lvs/ipvsadm_stats.log > /dev/null
+
+    $_ECHO "BEGIN ${TIMESTAMP}" >> ${OUTPUT_DIR}/lvs/nf_conntrack
+    $_CAT /proc/net/nf_conntrack >> ${OUTPUT_DIR}/lvs/nf_conntrack
+
+    $_ECHO "BEGIN ${TIMESTAMP}" >> ${OUTPUT_DIR}/lvs/ip_addr.log
+    /sbin/ip -o addr show 2>&1 | $_TEE -a ${OUTPUT_DIR}/lvs/ip_addr.log > /dev/null
+
+    logInfo "collectStatsLVS Completed"
+}
+
+startMonitorFmNbi() {
+    if [ ! -r ${SITEDATAROOT}/config/MONITOR_FM_NBI ] ; then
+        return
+    fi
+
+    if [ "${SERVICE_GROUP}" != "nbalarmirpagentcorba" ] ; then
+        return
+    fi
+
+    # We only want to do this one place
+    # So we get the "alias" and see if this is nbalarmirp-1-internal
+    $_GETENT hosts $($_HOSTNAME) | $_GREP -w nbalarmirp-1-internal > /dev/null
+    if [ $? -eq 0 ] ; then
+        initClusterDataDir
+        if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+            return
+        fi
+
+        FM_NBI_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/fmnbi
+        if [ ! -d ${FM_NBI_CLUSTERED_DIR} ] ; then
+            mkdir ${FM_NBI_CLUSTERED_DIR}
+        fi
+        ${_ECHO} "1f1::*" > ${FM_NBI_CLUSTERED_DIR}/notif.cfg
+        ${UTILDIR}/bin/notif -config ${FM_NBI_CLUSTERED_DIR}/notif.cfg --save ${FM_NBI_CLUSTERED_DIR}/events.txt \
+                  --maxtime 90000 > ${FM_NBI_CLUSTERED_DIR}/notif.log 2>&1 &
+    fi
+}
+
+stopMonitorFmNbi() {
+    if [ "${SERVICE_GROUP}" != "nbalarmirpagentcorba" ] ; then
+        return
+    fi
+
+    $_GETENT hosts $($_HOSTNAME) | $_GREP -w nbalarmirp-1-internal > /dev/null
+    if [ $? -eq 0 ] ; then
+        initClusterDataDir
+        if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+            return
+        fi
+        FM_NBI_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/fmnbi
+        EXIT_FILE=${FM_NBI_CLUSTERED_DIR}/events.txt.exit
+        ${_TOUCH} ${EXIT_FILE}
+
+        let WAIT_TIME=0
+        let STILL_RUNNING=1
+        while [ ${STILL_RUNNING} -eq 1 ] && [ ${WAIT_TIME} -lt 60 ] ; do
+            let STILL_RUNNING=0
+            if [ -r ${EXIT_FILE} ] ; then
+                let STILL_RUNNING=1
+                let WAIT_TIME=${WAIT_TIME}+1
+                sleep 1
+            fi
+        done
+        if [ ${STILL_RUNNING} -eq 1 ] ; then
+            logWarning "Timed out waiting for notif to exit"
+        fi
+    fi
+}
+
+startMonitorFmEvents() {
+    if [ ! -r ${SITEDATAROOT}/config/MONITOR_FM_EVENTS ] ; then
+        return
+    fi
+
+    if [ "${SERVICE_GROUP}" = "nbibnsifm" ] ; then
+        # Hack here, the required jar files aren't on the JMS server host
+        # So we copy one into the config directory
+        # We only want to do this one place
+        # So we get the "alias" and see if this is bnsiserv-1-internal
+        $_GETENT hosts $($_HOSTNAME) | $_GREP -w bnsiserv-1-internal > /dev/null
+        if [ $? -eq 0 ] ; then
+            SDK_JAR_DIR=/opt/ericsson/jboss/modules/com/ericsson/oss/itpf/sdk/service-framework
+            for JAR_NAME in sdk-modeled-eventbus-api sdk-modeled-eventbus-core ; do
+                JAR_PATH=$($_FIND ${SDK_JAR_DIR} -name "${JAR_NAME}-*.jar" | $_EGREP -v 'sources|javadoc' | $_HEAD -1)
+                JAR_FILE=$($_BASENAME ${JAR_PATH})
+                if [ ! -r ${SITEDATAROOT}/config/${JAR_FILE} ] ; then
+                    $_FIND ${SITEDATAROOT}/config -name "${JAR_NAME}-*.jar" -delete
+                    $_CP ${JAR_PATH} ${SITEDATAROOT}/config
+                fi
+            done
+            # Now extract the fmprocessedeventmodel from the bnsi-server-ear
+            BNSI_EAR=$(find /opt/ericsson/com.ericsson.oss.nbi.fm.bnsi-server -name 'bnsi-server-ear-*.ear')
+            FMPROCESSEDEVENTMODEL_JAR=$(/usr/bin/jar tf ${BNSI_EAR} | ${_GREP} -w fmprocessedeventmodel | $_EGREP '\.jar$')
+            FMPROCESSEDEVENTMODEL_JAR_FILE=$(${_BASENAME} ${FMPROCESSEDEVENTMODEL_JAR})
+            if [ ! -r ${SITEDATAROOT}/config/${FMPROCESSEDEVENTMODEL_JAR_FILE} ] ; then
+                $_FIND ${SITEDATAROOT}/config -name "fmprocessedeventmodel-*.jar" -delete
+                ${_MKDIR} /tmp/ddc.$$
+                cd /tmp/ddc.$$
+                /usr/bin/jar xf ${BNSI_EAR} ${FMPROCESSEDEVENTMODEL_JAR}
+                ${_MV} ${FMPROCESSEDEVENTMODEL_JAR} ${SITEDATAROOT}/config
+                cd /tmp
+                ${_RM} -rf /tmp/ddc.$$
+            fi
+        fi
+    elif [ -d /ericsson/jms/data ] ; then
+        JBOSS_INSTANCE=$($_PS -e -o args | $_SED -n 's:^java.*-Djboss.messaging.data.directory=[^ ]*\(jms\).*:\1:pI')
+        if [ ! -z "${JBOSS_INSTANCE}" ] ; then
+            JAR_PATHS=""
+            for JAR_NAME in sdk-modeled-eventbus-api sdk-modeled-eventbus-core fmprocessedeventmodel ; do
+                JAR_PATH=$($_FIND ${SITEDATAROOT}/config -name "${JAR_NAME}-*.jar")
+                if [ -z ${DPS_JAR_PATH} ] ; then
+                    $_SLEEP 60
+                    JAR_PATH=$($_FIND ${SITEDATAROOT}/config -name "${JAR_NAME}-*.jar")
+                fi
+
+                if [ -z "${JAR_PATH}" ] ; then
+                    logWarning "Could not get ${JAR_NAME} jar"
+                    return
+                fi
+
+                if [ ! -z "${JAR_PATHS}" ] ; then
+                    JAR_PATHS="${JAR_PATHS}:"
+                fi
+                JAR_PATHS="${JAR_PATHS}${JAR_PATH}"
+            done
+            JAR_PATHS="${JAR_PATHS}:/opt/opendj/lib/slf4j-api.jar"
+
+            initClusterDataDir
+            if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+                return
+            fi
+
+            JMS_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/jms
+            if [ ! -d ${JMS_CLUSTERED_DIR} ] ; then
+                mkdir ${JMS_CLUSTERED_DIR}
+            fi
+
+            ${UTILDIR}/bin/jmsclient -d ${JAR_PATHS} --topic FMAlarmOutTopic --output ${JMS_CLUSTERED_DIR}/fm.events \
+                      --exit ${DATAROOT}/${DATE}/TOR/fm.exit --maxtime 90000 \
+                      > ${DATAROOT}/${DATE}/TOR/fm.log 2>&1 &
+
+        fi
+    fi
+}
+
+startMonitorDpsEvents() {
+    if [ "${SERVICE_GROUP}" = "medrouter" ] ; then
+        # Hack here, theres no dps-api jar file on the JMS server host
+        # So we copy one into the config directory
+        # We only want to do this one place
+        isSgInstance medrouter 1
+        if [ "${IS_SG_INST_RESULT}" = "true" ] ; then
+            DIR_JAR_DIR=/opt/ericsson/jboss/modules/com/ericsson/oss/itpf/datalayer/dps/api/main
+            DPS_JAR_PATH=$($_FIND ${DIR_JAR_DIR} -name 'dps-api-*.jar' | $_EGREP -v 'sources|javadoc' | $_HEAD -1)
+            DPS_JAR_FILE=$($_BASENAME ${DPS_JAR_PATH})
+            if [ ! -r ${SITEDATAROOT}/config/${DPS_JAR_FILE} ] ; then
+                logInfo "Copying ${DPS_JAR_PATH}"
+                $_CP ${DPS_JAR_PATH} ${SITEDATAROOT}/config
+                # Get the list of older DPS jars
+                JAR_LIST=$(${_LS} -t ${SITEDATAROOT}/config | $_EGREP '^dps-api-*' | $_TAIL --lines +3)
+                for JAR in ${JAR_LIST} ; do
+                    logInfo "Removing ${JAR}"
+                    ${_RM} ${SITEDATAROOT}/config/${JAR}
+                done
+            fi
+        fi
+    elif [ -d /ericsson/jms/data ] ; then
+        JBOSS_INSTANCE=$($_PS -e -o args | $_SED -n 's:^java.*-Djboss.messaging.data.directory=[^ ]*\(jms\).*:\1:pI')
+        if [ ! -z "${JBOSS_INSTANCE}" ] ; then
+            initClusterDataDir
+            if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+                return
+            fi
+
+            JMS_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/jms
+            if [ ! -d ${JMS_CLUSTERED_DIR} ] ; then
+                mkdir ${JMS_CLUSTERED_DIR}
+            fi
+
+            # Start monitoring DPS events
+            DPS_JAR_PATH=$($_LS -t ${SITEDATAROOT}/config | $_EGREP '^dps-api-*' | ${_HEAD} --lines 1)
+            if [ -z ${DPS_JAR_PATH} ] ; then
+                $_SLEEP 60
+                DPS_JAR_PATH=$($_LS -t ${SITEDATAROOT}/config | $_EGREP '^dps-api-*' | ${_HEAD} --lines 1)
+            fi
+
+            if [ -z "${DPS_JAR_PATH}" ] ; then
+                logWarning "Could not get dps-api jar"
+                return
+            fi
+
+            ${UTILDIR}/bin/jmsclient -d ${SITEDATAROOT}/config/${DPS_JAR_PATH} --output ${JMS_CLUSTERED_DIR}/dps.events \
+                      --exit ${DATAROOT}/${DATE}/TOR/dps.exit --maxtime 90000 \
+                      > ${DATAROOT}/${DATE}/TOR/dps.log 2>&1 &
+        fi
+    fi
+}
+
+stopJmsClients() {
+    logInfo "stopJmsClients Starting"
+
+    initClusterDataDir
+    for TYPE in dps fm ; do
+        if [ -r ${DATAROOT}/${DATE}/TOR/${TYPE}.log ] ; then
+            $_TOUCH ${DATAROOT}/${DATE}/TOR/${TYPE}.exit
+        fi
+    done
+
+    let WAIT_TIME=0
+    let STILL_RUNNING=1
+    while [ ${STILL_RUNNING} -eq 1 ] && [ ${WAIT_TIME} -lt 60 ] ; do
+        let STILL_RUNNING=0
+        for TYPE in dps fm ; do
+            if [ -r ${DATAROOT}/${DATE}/TOR/${TYPE}.exit ] ; then
+                let STILL_RUNNING=1
+            fi
+        done
+
+        let WAIT_TIME=${WAIT_TIME}+1
+        sleep 1
+    done
+
+    if [ ${STILL_RUNNING} -eq 1 ] ; then
+        logWarning "Timed out waiting for jmsclient to exit"
+    else
+        logInfo "stopJmsClients Completed"
+    fi
+}
+
+initJMS() {
+    # If we've already checked, then just return
+    if [ ! -z "${HAS_JMS}" ] ; then
+        return
+    fi
+
+    # Note: The SG RPM for JMS is ERICenmsgjmsserver_CXP9031572, so
+    # if we have SERVICE_GROUP=jms this means we on cloud native
+    HAS_JMS=no
+    if [ -d /ericsson/jms/data ] ; then
+        # On phyiscal we want to check the the JMS server is up and running
+        /usr/bin/pgrep -f 'Djboss.messaging.data.directory' > /dev/null
+        if [ $? -eq 0 ] ; then
+            HAS_JMS=yes
+        fi
+    elif [ "${SERVICE_GROUP}" = "jmsserver" ] ; then
+        HAS_JMS=yes
+    fi
+
+    if [ "${HAS_JMS}" != "yes" ] ; then
+        return
+    fi
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    # If we're already setup then just return
+    if [ ! -z "${JMS_CLUSTERED_DIR}" ] ; then
+        return
+    fi
+
+    JMS_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/jms
+    if [ ! -d ${JMS_CLUSTERED_DIR} ] ; then
+        mkdir ${JMS_CLUSTERED_DIR}
+    fi
+
+    setJbossEnvironment
+
+    if [ ${EAP_VERSION} -eq 7 ] ; then
+        JMS_CMD_PREFIX="/subsystem=messaging-activemq/server=default"
+    else
+        JMS_CMD_PREFIX="/subsystem=messaging/hornetq-server=default"
+    fi
+
+}
+
+collectJmsState() {
+    initJMS
+    if [ "${HAS_JMS}" != "yes" ] ; then
+        return
+    fi
+
+    for ACTION in list-all-consumers-as-json list-connections-as-json list-producers-info-as-json ; do
+        /ericsson/3pp/jboss/bin/jboss-cli.sh -c --command="${JMS_CMD_PREFIX}:${ACTION}" > ${JMS_CLUSTERED_DIR}/${ACTION} 2>&1
+    done
+
+    # TORF-187006: Collect JMS config file to check Q Limits
+    if [ -r ${STANDALONE_XML} ] ; then
+        $_CP -f ${STANDALONE_XML} ${JMS_CLUSTERED_DIR}/jms-standalone-enm.xml
+        ${_SED} -i 's/password="[a-zA-Z0-9]\+"/password=""/g' ${JMS_CLUSTERED_DIR}/jms-standalone-enm.xml
+    else
+        logWarning "No ${JMS_CONFIG_XML} file exists"
+    fi
+}
+
+collectJmsConnections() {
+    initJMS
+    if [ "${HAS_JMS}" != "yes" ] ; then
+        return
+    fi
+
+    $_ECHO "BEGIN ${TIMESTAMP}" >> ${JMS_CLUSTERED_DIR}/connections.log
+    /ericsson/3pp/jboss/bin/jboss-cli.sh -c --command="${JMS_CMD_PREFIX}:list-connections-as-json" | \
+        $_EGREP '^    "result' | $_SED 's/^    "result" => "\(.*\)"$/\1/' | $_SED 's/\\"/"/g' | \
+        ${MONITORDIR}/appl/TOR/parseJmsConnections >> ${JMS_CLUSTERED_DIR}/connections.log 2>&1
+}
+
+collectOpenDJ() {
+    if [ "${CLOUD_DEPLOYMENT}" = "yes" ]  ; then
+        OPENDJ_PATH="/ericsson/opendj/opendj"
+    else
+        OPENDJ_PATH="/opt/opendj"
+    fi
+
+    if [ ! -d ${OPENDJ_PATH} ] ; then
+        return
+    fi
+
+    /usr/bin/pgrep -f 'org.opends.server.core.DirectoryServer' > /dev/null
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+
+    logDebug "Collecting OpenDJ Stats"
+
+    OPENDJLDAPMONLOG=${OUTPUT_DIR}/OpenDJLDAPMonitor.log
+    $_ECHO "${TIMESTAMP}" >> ${OPENDJLDAPMONLOG}
+    if [ -s /ericsson/enm/key-management/lib/kms_opendj_password.sh ] ; then
+        source /ericsson/enm/key-management/lib/kms_opendj_password.sh
+
+        export_opendj_password
+        LDAP_ADMIN_PASSWORD="${OPENDJ_PWD}"
+    else
+        LDAP_ADMIN_PASSWORD=$($_EGREP '^LDAP_ADMIN_PASSWORD' /ericsson/tor/data/global.properties | $_SED 's/^LDAP_ADMIN_PASSWORD=//' | /usr/bin/openssl enc -a -d -aes-128-cbc -salt -kfile /ericsson/tor/data/idenmgmt/opendj_passkey)
+    fi
+    ${OPENDJ_PATH}/bin/ldapsearch -p 1636 --useSSL --trustAll -D "cn=directory manager" -w "${LDAP_ADMIN_PASSWORD}" -b 'cn=monitor' 'objectclass=*' >> ${OPENDJLDAPMONLOG}
+}
+
+collectASR() {
+    local MY_SERVICE_GROUP="$1"
+    if [ "${MY_SERVICE_GROUP}" != "sparkworkerdef" ] ; then
+        return
+    fi
+
+    initClusterDataDir
+    for ASR in asrl asrn asr; do
+
+        ASR_DIR=${CLUSTEREDDATA_DIR}/${ASR}
+        if [ ! -d ${ASR_DIR} ] ; then
+            ${_MKDIR} ${ASR_DIR}
+        fi
+
+        if [ -r ${ASR_DIR}/driver_host ] ; then
+            ASR_DRIVER_HOST=$(${_CAT} ${ASR_DIR}/driver_host)
+            if [ "${ASR_DRIVER_HOST}" = "${HOSTNAME}" ] ; then
+                ${_PGREP} -f Ds=${ASR}-driver > /dev/null
+                if [ $? -ne 0 ] ; then
+                    # asr-driver isn't running any longer on this host
+                    ${_RM} -f ${ASR_DIR}/driver_host
+                    regenerateInstrXmls ${DATAROOT}/${DATE}/instr
+                else
+                    if [ -r ${SITEDATAROOT}/config/MONITOR_SPARK ] ; then
+                        ${TOR_MONITORDIR}/qspark --ip ${HOSTNAME} --action get_stats --out ${ASR_DIR}/spark_jobs.json
+                    fi
+                fi
+            fi
+        else
+            ${_PGREP} -f Ds=${ASR}-driver > /dev/null
+            if [ $? -eq 0 ] ; then
+                # regenerateInstrXmls will call createInstrXmls which will
+                # create the driver_host file when it finds the driver is present
+                regenerateInstrXmls ${DATAROOT}/${DATE}/instr
+            fi
+        fi
+    done
+}
+
+verifyNasAvailable() {
+    setConfigValue DDC_DISABLE_NAS_CHECK
+    if [ "${DDC_DISABLE_NAS_CHECK}" = "true" ] ; then
+            logDDCInfo "NAS check disabled"
+            return
+    fi
+
+    # Wait for NAS to come online
+    logDDCInfo "Checking for SFS"
+    local wait=0
+    DDC_DATA_MOUNTED=0
+    NAS_CHECK=${SITEDATAROOT}/.$($_HOSTNAME)_NAS
+
+    while [ ${DDC_DATA_MOUNTED} -eq 0 ] ; do
+    # Check to see if we've mounted it yet
+        $_GREP -w ${SITEDATAROOT} /etc/mtab > /dev/null
+        if [ $? -eq 0 ] ; then
+            $_TOUCH ${NAS_CHECK}
+            if [ $? -eq 0 ] ; then
+                DDC_DATA_MOUNTED=1
+            fi
+        fi
+
+       if [ $DDC_DATA_MOUNTED -eq 0 ] ; then
+            $_SLEEP 5
+       else
+            $_RM -f ${NAS_CHECK}
+       fi
+    done
+
+    logDDCInfo "SFS is ready"
+    source ${DDCDIR}/etc/global.env
+
+    # If ddc_data directory in /var/tmp exists, remove it
+    if [ -d "/var/tmp/ddc_data" ] ; then
+        $_RM -rf /var/tmp/ddc_data
+    fi
+}
+
+verifyCloudInitDone() {
+    CLOUD_INIT_LOG=/var/log/cloud-init-output.log
+    if [ -r ${CLOUD_INIT_LOG} ] ; then
+        logDDCInfo "Checking if cloud-init has completed"
+        # Spin here waiting for cloud_init to log that it's finished
+        # MAX_CHECK control the max amount of checks/time that we will
+        # wait
+        local CHECK_COUNT=1
+        local MAX_CHECK=20
+        local CLOUD_INIT_FINISHED=0
+        while [ ${CLOUD_INIT_FINISHED} -eq 0 ] && [ ${CHECK_COUNT} -le ${MAX_CHECK} ] ; do
+            tail -1 ${CLOUD_INIT_LOG} | $_EGREP '^Cloud-init .* finished at|^The system is now up' > /dev/null
+            if [ $? -eq 0 ] ; then
+                CLOUD_INIT_FINISHED=1
+            else
+                CHECK_COUNT=$(expr $CHECK_COUNT + 1)
+                sleep 60
+            fi
+        done
+
+        if [ ${CHECK_COUNT} -gt ${MAX_CHECK} ] ; then
+            logDDCWarning "Maximum time to wait for cloud-init to finish has been exceeded"
+        else
+            logDDCInfo "Confirmed cloud-init has completed"
+        fi
+    fi
+}
+
+verifyJBossStarted() {
+    # If JBoss is installed wait up to 10 minutes for jboss monitor
+    # to report started
+
+    if [ ! -d /ericsson/3pp/jboss/bin ] ; then
+        return
+    fi
+
+    local WAIT_COUNT=0
+    local MAX_WAIT_COUNT=40
+    local DONE=0
+    while [ ${DONE} -eq 0 ] && [ ${WAIT_COUNT} -le ${MAX_WAIT_COUNT} ] ; do
+        $_SERVICE jboss monitor > /dev/null 2>&1
+        if [ $? -eq 0 ] ; then
+            logDDCInfo "jboss monitor reports started: WAIT_COUNT=${WAIT_COUNT}"
+            DONE=1
+        else
+            WAIT_COUNT=$($_EXPR ${WAIT_COUNT} + 1)
+            $_SLEEP 15
+        fi
+    done
+
+    if [ ${DONE} -eq 0 ] ; then
+        logDDCWarning "Timeout while waiting for jboss monitor to report started"
+    fi
+}
+
+getServiceGroup() {
+    local SERVICE_GRP=""
+    if [ -s ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP ] ; then
+        SERVICE_GRP=$($_CAT ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP)
+    else
+        local SERVICE_GRP_RPM=$($_RPM -q -a | $_EGREP '^ERICenmsg')
+        if [ ! -z "${SERVICE_GRP_RPM}" ] ; then
+            SERVICE_GRP=$(echo "${SERVICE_GRP_RPM}" | $_SED -e 's/^ERICenmsg//' -e 's/_CXP.*//')
+            $_ECHO "${SERVICE_GRP}" > ${DATAROOT}/${DATE}/TOR/SERVICE_GROUP
+        fi
+    fi
+    $_ECHO "${SERVICE_GRP}"
+}
+
+collectPuppetStatus() {
+
+    if [ -x $_MCO ]; then
+        logInfo "Collecting Puppet Status"
+
+        if [ ! -d ${OUTPUT_DIR}/litp ] ; then
+            ${_MKDIR} ${OUTPUT_DIR}/litp
+        fi
+
+        $_ECHO "###############################" >> ${OUTPUT_DIR}/litp/mco_puppet_status.log
+        $_ECHO "$($_DATE "+%Y-%m-%d %H:%M:%S")" >> ${OUTPUT_DIR}/litp/mco_puppet_status.log
+        $_MCO puppet status |& sed -r "s/\r|\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]/ /g" >> ${OUTPUT_DIR}/litp/mco_puppet_status.log
+        $_ECHO "###############################" >> ${OUTPUT_DIR}/litp/mco_puppet_status.log
+
+    else
+         logInfo "Unable to collect Puppet Status as the mcollective binary is not executable"
+    fi
+}
+
+#Collect ESM Data
+collectESMData() {
+    if [ ! -d "/var/ericsson/esm_ddc_data" ] ; then
+        return
+    fi
+
+    logInfo "Collecting ESM Data"
+
+    $_ECHO "monitoring" > ${OUTPUT_DIR}/tor_server_type
+
+    if [ ! -d ${OUTPUT_DIR}/esm ] ; then
+        ${_MKDIR} ${OUTPUT_DIR}/esm
+    fi
+    STARTTIME=`date --date="$SQL_DATE_ONLY" +%s%3N`
+    ENDTIME=`date +%s%3N`
+    curl -k -u esmadmin:ericssonadmin --o ${OUTPUT_DIR}/esm/recentAlerts.txt "https://localhost:7443/rest/reports/recentAlerts.csv?startTime=${STARTTIME}&endTime=${ENDTIME}"
+    curl -k -u esmadmin:ericssonadmin --o ${OUTPUT_DIR}/esm/alertDefinitions.csv "https://localhost:7443/rest/reports/alertDefinitions.csv"
+}
+
+collectEnmDeploymentFile() {
+    ENM_DEPLOYMENT_FILE_PATH="/opt/ericsson/enminst/runtime/enm_deployment.xml"
+    logDebug "Collecting enm deployment file"
+    if [ -f "${ENM_DEPLOYMENT_FILE_PATH}" ] ; then
+        LAST_MODIFIED_DATE=$($_DATE -r ${ENM_DEPLOYMENT_FILE_PATH} +'%Y-%m-%d')
+        if [ "${LAST_MODIFIED_DATE}" == "${SQL_DATE_ONLY}" ] ; then
+            $_CP -f ${ENM_DEPLOYMENT_FILE_PATH} ${OUTPUT_DIR}
+        else
+            logInfo "${ENM_DEPLOYMENT_FILE_PATH} is not collected as it is unmodified on current date"
+        fi
+    else
+        logInfo "${ENM_DEPLOYMENT_FILE_PATH} file is not available"
+    fi
+}
+
+collectOpendjLogs() {
+    if [ ! -d /opt/opendj ] ; then
+        return
+    fi
+
+    DEST_DIR="${OUTPUT_DIR}/opendj"
+    OPENDJ_LOG_DIR="/var/log/opendj"
+    FILES=("opendj-install-$SQL_DATE_ONLY" "opendj-replication-config-$SQL_DATE_ONLY" "opendj-password-change-$SQL_DATE_ONLY")
+    logDebug "Collecting opendj logs"
+
+    COLLECT_DATA=$($_ZGREP "$DDMONYYYY_DATE" "${OPENDJ_LOG_DIR}/server/server.out" | $_HEAD -1 | $_WC -l)
+
+    if [ ${COLLECT_DATA} -eq 1 ] ; then
+        [ ! -d ${DEST_DIR} ] && $_MKDIR -p ${DEST_DIR}
+        $_ZGREP "${DDMONYYYY_DATE}" "$OPENDJ_LOG_DIR/server/server.out" > ${DEST_DIR}/server.out
+    fi
+
+    for FILE in ${FILES[@]} ; do
+        COLLECT_DATA=$($_LS ${OPENDJ_LOG_DIR} | $_GREP $FILE )
+        if [ ! -z "$COLLECT_DATA" ] ; then
+            for LOG in ${COLLECT_DATA[@]} ; do
+                [ ! -d ${DEST_DIR} ] && $_MKDIR -p ${DEST_DIR}
+                $_ZGREP "$SQL_DATE_ONLY" "$OPENDJ_LOG_DIR/$LOG" > "${DEST_DIR}/$LOG"
+            done
+        fi
+    done
+
+}
+
+collectMySQLLogs() {
+
+    if [ ! -d /opt/mysql ] ; then
+        return
+    fi
+
+    if $($_SERVICE mysql status > /dev/null 2>&1) ; then
+
+        MYSQL_LOG_DIR="/var/log/mysql"
+        initClusterDataDir
+        DEST_DIR="${CLUSTEREDDATA_DIR}/mysql"
+        FILES=("install_mysql-$SQL_DATE_ONLY" "mysql-password-change-$SQL_DATE_ONLY" "mysqld.log" "mysql-numa.log")
+
+        logDebug "collecting MYSQL logs"
+
+        for FILE in ${FILES[@]} ; do
+            [ ! -d ${DEST_DIR} ] && $_MKDIR -p ${DEST_DIR}
+            if [ $FILE = "mysqld.log" ] ; then
+                COLLECT_DATA=$($_ZGREP "$YYMMDD_DATE" "${MYSQL_LOG_DIR}/$FILE" | $_WC -l)
+                if [ ${COLLECT_DATA} -gt 0 ] ; then
+                    $_ZGREP "$YYMMDD_DATE" "$MYSQL_LOG_DIR/$FILE" > "${DEST_DIR}/$FILE"
+                fi
+            elif [ $FILE = "mysql-numa.log" ] ; then
+                COLLECT_DATA=$($_ZGREP "$SQL_DATE_ONLY" "${MYSQL_LOG_DIR}/$FILE" | $_WC -l)
+                if [ ${COLLECT_DATA} -gt 0 ] ; then
+                    $_ZGREP "$SQL_DATE_ONLY" "$MYSQL_LOG_DIR/$FILE" > "${DEST_DIR}/$FILE"
+                fi
+            else
+                COLLECT_DATA=$($_LS ${MYSQL_LOG_DIR} | $_GREP $FILE )
+                if [ ! -z "$COLLECT_DATA" ] ; then
+                    for LOG in ${COLLECT_DATA[@]} ; do
+                        $_CP "$MYSQL_LOG_DIR/$LOG"  "${DEST_DIR}/"
+                    done
+                fi
+            fi
+        done
+    fi
+}
+
+rotateInstr() {
+    if [ ! -r ${SITEDATAROOT}/config/DELTA_COLLECTION ] ; then
+        return
+    fi
+
+    INSTR_OUTPUT_FILE=${DATAROOT}/${DATE}/instr.txt
+    if [ ! -r ${INSTR_OUTPUT_FILE} ] ; then
+        return
+    fi
+
+    INSTR_PID=$($_PGREP -f "s=instr.*-defaultLogFile ${INSTR_OUTPUT_FILE}")
+    if [ -z "${INSTR_PID}" ] ; then
+        logWarning "rotateInstr: No instr process found"
+        return
+    fi
+
+    declare -i FILE_INDEX=0
+    if [ -r ${DATAROOT}/${DATE}/instr.index ] ; then
+        FILE_INDEX=$($_CAT ${DATAROOT}/${DATE}/instr.index)
+    fi
+    let FILE_INDEX++
+
+    ROTATE_TO_FILE=$(printf "%s.%03d" ${DATAROOT}/${DATE}/instr.txt ${FILE_INDEX})
+
+    ${DDCDIR}/util/bin/instr -rotate ${ROTATE_TO_FILE} -pid ${INSTR_PID}
+    if [ $? -eq 0 ] ; then
+        $_ECHO $FILE_INDEX > ${DATAROOT}/${DATE}/instr.index
+    fi
+}
+
+collectWorkflows() {
+    if [ "${CLOUD_DEPLOYMENT}" != "yes" ] ; then
+        return
+    fi
+    ${TOR_MONITORDIR}/workflows -d ${SQL_DATE_ONLY} > ${DATAROOT}/${DATE}/TOR/workflows.log 2>&1
+}
+
+collectConsulState() {
+    if [ "${CLOUD_DEPLOYMENT}" != "yes" ] ; then
+        return
+    fi
+    if [ ! -d ${DATAROOT}/${DATE}/TOR/consul ] ; then
+        ${_MKDIR} ${DATAROOT}/${DATE}/TOR/consul
+    fi
+    $_CP -f /etc/consul.d/agent/config.json ${DATAROOT}/${DATE}/TOR/consul
+    /usr/bin/consul members > ${DATAROOT}/${DATE}/TOR/consul/members.txt 2>&1
+    $_CURL --silent localhost:8500/v1/status/leader > ${DATAROOT}/${DATE}/TOR/consul/leader.txt 2>&1
+}
+
+deltaCollectElasticsearch() {
+    if [ ! -r ${DATAROOT}/${DATE}/COLLECTION_START ] ; then
+        logWarning "deltaCollectElasticsearch called but ${DATAROOT}/${DATE}/COLLECTION_START doesn't exist"
+        return
+    fi
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    ELASTICSEARCH_CLUSTERED_DIR=${CLUSTEREDDATA_DIR}/elasticsearch
+    if [ ! -d ${ELASTICSEARCH_CLUSTERED_DIR} ] ; then
+        logWarning "${ELASTICSEARCH_CLUSTERED_DIR} not found"
+        return
+    fi
+
+    local FILE_LIST=$($_FIND ${ELASTICSEARCH_CLUSTERED_DIR} \( -name 'elasticsearch.log.gz*' -o -name 'eventdata.log.gz*' \) -newer ${DATAROOT}/${DATE}/COLLECTION_START)
+    if [ ! -z "${FILE_LIST}" ] ; then
+        ${_MKDIR} ${DELTA_ROOT}/elasticsearch
+        for FILE in ${FILE_LIST} ; do
+            ${_LN} -s ${FILE} ${DELTA_ROOT}/elasticsearch
+        done
+    fi
+}
+
+deltaCollectFLS() {
+    if [ ! -r ${DATAROOT}/${DATE}/COLLECTION_START ] ; then
+        logWarning "deltaCollectFLS called but ${DATAROOT}/${DATE}/COLLECTION_START doesn't exist"
+        return
+    fi
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    FLS_DIR=${CLUSTEREDDATA_DIR}/fls
+    if [ ! -d ${FLS_DIR} ] ; then
+        logWarning "${FLS_DIR} not found"
+        return
+    fi
+
+    local FILE_LIST=$($_FIND ${FLS_DIR} -name 'fls.*.gz' -newer ${DATAROOT}/${DATE}/COLLECTION_START)
+    if [ ! -z "${FILE_LIST}" ] ; then
+        ${_MKDIR} ${DELTA_ROOT}/fls
+        for FILE in ${FILE_LIST} ; do
+            ${_LN} -s ${FILE} ${DELTA_ROOT}/fls
+        done
+    fi
+}
+
+# Initiate 'enm_healthcheck.sh' in the background and collect the output if it's not done
+# already for the given day
+collectEnmHealthCheckOutput() {
+    if [ -r /opt/ericsson/enminst/bin/enm_healthcheck.sh ] && [ ! -r ${DATAROOT}/${DATE}/TOR/enm_healthcheck.log ] ; then
+        logInfo "Initiating ENM health-check script in the background"
+        if [ -x "$_SETSID" ] ; then
+            $_SETSID /bin/bash -c "/opt/ericsson/enminst/bin/enm_healthcheck.sh -v 2>&1 | $_TEE ${DATAROOT}/${DATE}/TOR/enm_healthcheck.log > /dev/null" &
+        else
+            /bin/bash -c "/opt/ericsson/enminst/bin/enm_healthcheck.sh -v 2>&1 | $_TEE ${DATAROOT}/${DATE}/TOR/enm_healthcheck.log > /dev/null" &
+        fi
+    fi
+}
+
+# Check if any ENM health-check script is still running. If the script is still running then
+# kill it to stop the collection
+stopEnmHcOutputCollection() {
+
+    local ENM_HC_SCRIPT_ID=$($_PGREP -f "enm_healthcheck.sh.*$_TEE.*/${DATE}/.*enm_healthcheck.log")
+    if [ ! -z "${ENM_HC_SCRIPT_ID}" ] ; then
+        # Kill the process
+        logInfo "Killing ENM health-check script process with PID: ${ENM_HC_SCRIPT_ID}"
+        $_KILL -9 -${ENM_HC_SCRIPT_ID}
+    fi
+
+    if [ ! -z "$($_PGREP -f "enm_healthcheck.sh.*$_TEE.*/${DATE}/.*enm_healthcheck.log")" ] ; then
+        logWarning "Unable to kill ENM health-check script"
+    fi
+}
+
+collectNeo4j() {
+    initNeo4jVariables
+    if [ "${NEO4J_RUNNING}" != "yes" ] ; then
+        return
+    fi
+
+    # Get any entries of interest from any debug log modified today
+    for LOG_DIR in /var/log/neo4j /ericsson/neo4j_data/logs ; do
+        if [ -d ${LOG_DIR} ] ; then
+            DEBUG_LOGS=$(${_FIND} ${LOG_DIR} -type f -name 'debug.*' -mtime -1 | ${_SORT} -r)
+            if [ -r ${NEO4J_DIR}/debug.${NEO4J_IP} ] ; then
+                ${_RM} -f ${NEO4J_DIR}/debug.${NEO4J_IP}
+            fi
+            for DEBUG_LOG in ${DEBUG_LOGS} ; do
+                ${_EGREP} "RaftMachine|RateState|RaftLogShipper|CheckPointerImpl" ${DEBUG_LOG} >> ${NEO4J_DIR}/debug.${NEO4J_IP}
+            done
+        fi
+    done
+
+    # We only want to this on the leader
+    if [ "${NEO4J_HAS_CAUSAL_CLUSTER}" = "yes" ] && [ "${NEO4J_HAS_CAUSAL_ROLE}" != "leader" ] ; then
+        return
+    fi
+
+    # Collect "core" MOs (NetworkElement,etc.)
+    if [ ! -d ${NEO4J_DIR}/mo ] ; then
+        ${_MKDIR} ${NEO4J_DIR}/mo
+    fi
+    ${QUERY_NEO4J} --action get_mo --dir ${NEO4J_DIR}/mo
+
+    # Collect counts only once
+    if [ ! -r ${NEO4J_DIR}/mo.counts ] ; then
+        ${QUERY_NEO4J} --action counts > ${NEO4J_DIR}/mo.counts
+    fi
+
+    # Collect PMIC MOs only once
+    if [ ! -d ${NEO4J_DIR}/pmic ] ; then
+        ${_MKDIR} ${NEO4J_DIR}/pmic
+        ${QUERY_NEO4J} --action get_pmic_mo --dir ${NEO4J_DIR}/pmic
+    fi
+}
+
+collectNeo4jLeader() {
+    initNeo4jVariables
+    if [ "${NEO4J_RUNNING}" != "yes" ] ; then
+        return
+    fi
+
+    if [ "${NEO4J_HAS_CAUSAL_CLUSTER}" != "yes" ] ; then
+        return
+    fi
+
+    if [ "${NEO4J_HAS_CAUSAL_ROLE}" != "leader" ] ; then
+        return
+    fi
+
+    ${_ECHO} ${TIMESTAMP} >> ${NEO4J_DIR}/cluster_overview.log
+    ${QUERY_NEO4J} --action cluster_overview >> ${NEO4J_DIR}/cluster_overview.log
+}
+
+initNeo4jVariables() {
+    if [ ! -z "${NEO4J_RUNNING}" ] ; then
+        return
+    fi
+
+    NEO4J_RUNNING="no"
+    useRemoteServiceCollection
+    if [ "${USE_REMOTE_SERVICE_COLLECTION}" = "yes" ] ; then
+        NEO4J_RUNNING="yes"
+
+        initClusterDataDir
+        NEO4J_DIR=${CLUSTEREDDATA_DIR}/neo4j
+        if [ ! -d ${NEO4J_DIR} ] ; then
+            $_MKDIR ${NEO4J_DIR}
+        fi
+
+        # For now, assume that it's always a causal cluster
+        NEO4J_HAS_CAUSAL_CLUSTER="yes"
+        NEO4J_HAS_CAUSAL_ROLE="leader"
+        NEO4J_IP=neo4j
+
+        QUERY_NEO4J="${TOR_MONITORDIR}/qneo4j --ip neo4j --consul consul"
+    else
+        local NEO4J_CONF="/ericsson/3pp/neo4j/conf/neo4j.conf"
+        if [ ! -f ${NEO4J_CONF} ] ; then
+            return
+        fi
+
+        local NEO4J_USER="neo4j"
+        local CLASS_NAME="com.neo4j.server.enterprise.*EntryPoint"
+
+        # For neo4j 3.x for >= 3.4, search string is com.neo4j.server.enterprise.CommercialEntryPoint
+        # For neo4j 4.x for 4 >= 0, search string is com.neo4j.server.enterprise.EntrpriseEntryPoint
+        # We are not giving support for the neo4j search string "org.neo4j.server" used in pre 3.4 which is pre 18.3
+
+        /usr/bin/pgrep -u ${NEO4J_USER} -f ${CLASS_NAME} > /dev/null
+        if [ $? -ne 0 ] ; then
+            return
+        fi
+
+        NEO4J_SEARCH_STRING=".*${CLASS_NAME}.*"
+        NEO4J_RUNNING="yes"
+        NEO4J_IP=$($_EGREP "^dbms.connector.http.advertised_address=" ${NEO4J_CONF} | ${_AWK} -F= '{print $2}' | ${_AWK} -F: '{print $1}')
+        QUERY_NEO4J="${TOR_MONITORDIR}/qneo4j --ip $NEO4J_IP"
+
+        initClusterDataDir
+        NEO4J_DIR=${CLUSTEREDDATA_DIR}/neo4j
+        if [ ! -d ${NEO4J_DIR} ] ; then
+            $_MKDIR ${NEO4J_DIR}
+        fi
+
+        NEO4J_HAS_CAUSAL_CLUSTER="no"
+        $_EGREP --silent "^dbms.mode=CORE" ${NEO4J_CONF}
+        if [ $? -eq 0 ] ; then
+            NEO4J_HAS_CAUSAL_CLUSTER="yes"
+            NEO4J_HAS_CAUSAL_ROLE="follower"
+            ${QUERY_NEO4J} --action writable > ${NEO4J_DIR}/writable.${NEO4J_IP}
+            ${_EGREP} "^true" --silent ${NEO4J_DIR}/writable.${NEO4J_IP}
+            if [ $? -eq 0 ] ; then
+                NEO4J_HAS_CAUSAL_ROLE="leader"
+            fi
+        fi
+     fi
+}
+
+checkDdcUploadFile() {
+        DDC_UPLOAD_FILE="${SITEDATAROOT}/config/ddc_upload"
+
+        if [ ! -r "${DDC_UPLOAD_FILE}" ] ; then
+                return
+        else
+            $_CP ${DDC_UPLOAD_FILE} /etc/cron.d/
+        fi
+
+}
+
+collectModClusterOutput() {
+    if [ ! -d ${DATAROOT}/${DATE}/TOR/httpd ] ; then
+        ${_MKDIR} ${DATAROOT}/${DATE}/TOR/httpd
+    fi
+    HTTPD_HOSTS=$( $_CAT /etc/hosts | $_GREP "httpd-instance" | $_AWK '{print $2}')
+    for HOST in ${HTTPD_HOSTS}; do
+        MOD_CLUSTER_LOG=${DATAROOT}/${DATE}/TOR/httpd/manager_info.${HOST}
+        $_ECHO "${TIMESTAMP}" >> ${MOD_CLUSTER_LOG}
+        $_CURL -s  -X INFO ${HOST}:8666 >> ${MOD_CLUSTER_LOG}
+
+        SERVER_STATUS_LOG=${DATAROOT}/${DATE}/TOR/httpd/server_status.${HOST}
+        $_ECHO "${TIMESTAMP}" >> ${SERVER_STATUS_LOG}
+        $_CURL -s ${HOST}:8666/server-status >> ${SERVER_STATUS_LOG}
+
+    done
+}
+
+isSgInstance() {
+    local SG=$1
+    local INSTANCE=$2
+
+    local ALIAS="${SG}-${INSTANCE}-internal"
+    # Note: There's a bug in cloud TORF-218962, where multiple
+    # IP address are registered with the same alias and also
+    # consul is returning in a round-robin order. So use sort/head
+    # here to get a deterministic value
+    local ALIAS_IP=$(${_GETENT} hosts ${ALIAS} | ${_AWK} '{print $1}' | ${_SORT} | ${_HEAD} --lines 1)
+
+    getIpv4Address ${HOSTNAME}
+
+    local HOST_IP="${IPV4_ADDRESS}"
+
+    if [ "${ALIAS_IP}" = "${HOST_IP}" ] ; then
+        IS_SG_INST_RESULT="true"
+    else
+        IS_SG_INST_RESULT="false"
+    fi
+}
+
+getIpv4Address() {
+    local HOSTNAME=$1
+    IPV4_ADDRESS=$(${_GETENT} ahosts ${HOSTNAME} | ${_GREP} STREAM | ${_GREP} -v : | ${_AWK} '{print $1}' | ${_SORT} | ${_HEAD} --lines 1)
+}
+
+useRemoteServiceCollection() {
+    if [ -z "${USE_REMOTE_SERVICE_COLLECTION}" ] ; then
+        USE_REMOTE_SERVICE_COLLECTION="no"
+        if [ "${IS_DDC_MASTER}" = "yes" ] ; then
+            # Checking REMOTE_WRITER is the old mechanism and has been replaced
+            # by IS_CLOUD_NATIVE
+            if [ "${IS_CLOUD_NATIVE}" = "yes" ] || [ ! -z "${REMOTE_WRITER}" ] ; then
+                USE_REMOTE_SERVICE_COLLECTION="yes"
+            fi
+        fi
+    fi
+}
+
+deltaCollectUlsaFLS() {
+    if [ ! -r ${DATAROOT}/${DATE}/COLLECTION_START ] ; then
+        logWarning "deltaCollectUlsaFLS called but ${DATAROOT}/${DATE}/COLLECTION_START doesn't exist"
+        return
+    fi
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    ULSA_DIR=${CLUSTEREDDATA_DIR}/ulsa
+    if [ ! -d ${ULSA_DIR} ] ; then
+        logWarning "${ULSA_DIR} not found"
+        return
+    fi
+
+    local FILE_LIST=$($_FIND ${ULSA_DIR} -name 'ulsa.*.gz' -newer ${DATAROOT}/${DATE}/COLLECTION_START)
+    if [ ! -z "${FILE_LIST}" ] ; then
+        ${_MKDIR} ${DELTA_ROOT}/ulsa
+        for FILE in ${FILE_LIST} ; do
+            ${_LN} -s ${FILE} ${DELTA_ROOT}/ulsa
+        done
+    fi
+}
+
+collectUlsaFLS() {
+    TZ_FILE=$1
+
+    checkPostgresAvailable
+    if [ "${POSTGRES_AVAILABLE}" != "yes" ] ; then
+        return
+    fi
+
+    get_pg_pass
+    setPsqlBase
+    if [ -z "${PSQL_BASE}" ] ; then
+        return
+    fi
+
+    logDebug "Colecting Ulsa information from the fls db table ulsa_info into ulsa.log.*.gz"
+
+    #
+    # We want the times in seconds since epoch (makes the processing
+    # faster if we don't have to convert all the times). However, the
+    # file_creationtime_in_oss, sample_time columns of the ulsa_info table
+    # in the fls db are 'timestamp without time zone'. So we have to specify the timezone
+    # to get postgres to do the conversion correctly
+    #
+
+    FLS_ULSA_TIMEZONE=$($_CAT ${TZ_FILE} | $_AWK -F: '{print $1}')
+
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    ULSA_DIR=${CLUSTEREDDATA_DIR}/ulsa
+    if [ ! -d ${ULSA_DIR} ] ; then
+        $_MKDIR ${ULSA_DIR}
+    fi
+
+    DAY_START="${SQL_DATE_ONLY} 00:00:00"
+    if [ -r ${ULSA_DIR}/lastsample ] ; then
+        LAST_SAMPLE=$($_CAT ${ULSA_DIR}/lastsample)
+        if [ -z "${LAST_SAMPLE}" ] ; then
+            logWarning "collectUlsaFLS: Previous lastsample in collectUlsaFLS is empty"
+            return
+        fi
+        WHERE="sample_time > '${LAST_SAMPLE}'"
+    else
+        WHERE="file_creationtime_in_oss >= '${DAY_START}'"
+    fi
+
+    PSQL="${PSQL_BASE} --dbname=flsdb --tuples-only --no-align"
+
+    # Get the latest sample time of the most recent entry in ulsa_info
+    MAX_QUERY="SELECT MAX(sample_time) FROM ulsa_info WHERE ${WHERE} AND file_creationtime_in_oss < TIMESTAMP '${DAY_START}' + INTERVAL '1 DAY'"
+    PGPASSWORD=${PG_PASS} ${PSQL} --command="${MAX_QUERY}" --output=${ULSA_DIR}/maxsample
+    if [ $? -ne 0 ] ; then
+        logError "ERROR: Failed to get last sample from ulsa_info"
+        return
+    fi
+
+    # Is the maxsample valid
+    $_EGREP '^[0-9]+\-[0-9]+\-[0-9]+ [0-9]+:[0-9]+:[0-9]+' ${ULSA_DIR}/maxsample > /dev/null
+
+    if [ $? -ne 0 ] ; then
+        logError "Error: maxsample is not valid returning"
+        return
+    fi
+    MAX_ID=$($_CAT ${ULSA_DIR}/maxsample)
+    $_MV -f ${ULSA_DIR}/maxsample ${ULSA_DIR}/lastsample
+
+    WHERE="${WHERE} AND file_creationtime_in_oss < TIMESTAMP '${DAY_START}' + INTERVAL '1 DAY'"
+
+    let INDEX=1
+    while [ -r ${ULSA_DIR}/ulsa.log.${INDEX}.gz ] ; do
+        let INDEX=${INDEX}+1
+    done
+
+    COLUMNS="id,node_name,node_type,data_type,radio_unit,rf_port,file_size,file_location"
+    COLUMNS="${COLUMNS}, extract(epoch from file_creationtime_in_oss AT TIME ZONE '${FLS_ULSA_TIMEZONE}') AS file_creationtime"
+    COLUMNS="${COLUMNS}, extract(epoch from sample_time AT TIME ZONE '${FLS_ULSA_TIMEZONE}') AS sample_time"
+    QUERY="SELECT ${COLUMNS} FROM ulsa_info WHERE ${WHERE} ORDER BY sample_time";
+    PGPASSWORD=${PG_PASS} ${PSQL} --command="${QUERY}" | $_GZIP -c > ${ULSA_DIR}/.ulsa.log.${INDEX}.gz
+    ${_MV} ${ULSA_DIR}/.ulsa.log.${INDEX}.gz ${ULSA_DIR}/ulsa.log.${INDEX}.gz
+}
+
+#
+# Make file jbossConfig at start-up
+#
+setJbossEnvironment() {
+    # If we've already done the setup then just return
+    if [ ! -z "${STANDALONE_XML}" ] ; then
+        return
+    fi
+
+    STANDALONE_XML=/ericsson/3pp/jboss/standalone/configuration/standalone-enm.xml
+
+    # Default to EAP 6 for now
+    EAP_VERSION=6
+    if [ -r /ericsson/3pp/jboss/eap7.txt ] ; then
+        EAP_VERSION=7
+    fi
+}
+
+# Set JBOSS_JMX_SERVICE_URL with the correct values depending on
+# the EAP version.
+setJBossJmxServiceURL() {
+    if [ ! -z "${JBOSS_JMX_SERVICE_URL}" ] ; then
+        return
+    fi
+    # Default to EAP 6 for now
+    local REMOTING_PROTOCOL="remoting-jmx"
+    local JBOSS_MGT_IP='127.0.0.1'
+    local JBOSS_MGT_PORT=9999
+
+    if [ ${EAP_VERSION} -eq 7 ] ; then
+        REMOTING_PROTOCOL="remote+http"
+        JBOSS_MGT_PORT=9990
+    fi
+
+    JBOSS_JMX_SERVICE_URL="service:jmx:${REMOTING_PROTOCOL}://${JBOSS_MGT_IP}:${JBOSS_MGT_PORT}"
+}
+
+collectEsxiMetrics() {
+    if [ ! -r ${SITEDATAROOT}/config/VIO ] ; then
+        return
+    fi
+
+    vIp=$($_CONSUL kv get enm/system_configuration/vmware/ip)
+    vUser=$($_CONSUL kv get enm/system_configuration/vmware/vcenter_monitor_username)
+    vPass=$($_CONSUL kv get enm/system_configuration/vmware/vcenter_monitor_password)
+    if [ -z "${vIp}" ] || [ -z "${vUser}" ] || [ -z "${vPass}" ] ; then
+        logInfo "Invalid HOST/USER/PASS - Exiting ESXI collection"
+        return
+    fi
+    REMOTEHOSTS_DIR="${DATAROOT}/${DATE}/remotehosts"
+    if [ -s ${SITEDATAROOT}/config/VIO ] ; then
+        startTime=$($_CAT ${SITEDATAROOT}/config/VIO)
+    else
+       #The below case is to handle startTime for first collection.
+       startTime=$($_DATE -u "+%Y-%m-%d 00:00:00")
+    fi
+    endTime=$($_DATE -u "+%Y-%m-%d %H:%M:%S")
+    python ${DDCDIR}/util/bin/extract_esxi_metrics.py -s ${vIp} -u ${vUser} -p ${vPass} -d ${REMOTEHOSTS_DIR} -st "$startTime" -et "$endTime" -dt ${DATE}
+    if [ $? -ne 0 ] ; then
+        logWarning "Failed to collect ESXI data"
+        return
+    fi
+    # We randomly pick one ESXI host to get the lasttimestamp
+    ESXI_HOST=$($_LS ${REMOTEHOSTS_DIR} | $_GREP "_ESXI" | $_HEAD -1)
+    if [ $? -eq 0 ] && [ -s ${REMOTEHOSTS_DIR}/${ESXI_HOST}/${DATE}/server/esxi_metrics.txt ] ; then
+        lastCollected=$($_TAIL -1 ${REMOTEHOSTS_DIR}/${ESXI_HOST}/${DATE}/server/esxi_metrics.txt | $_AWK -F\; '{print $1}')
+        $_ECHO $lastCollected > ${SITEDATAROOT}/config/VIO
+    fi
+}
+
+collectSAN() {
+    if [ ! -x /usr/bin/litp ] ; then
+        return
+    fi
+
+    if [ ! -r ${OUTPUT_DIR}/san1.litp ] ; then
+        /usr/bin/litp show -p /infrastructure/storage/storage_providers/san1 \
+            | $_SED 's/"//g' > ${OUTPUT_DIR}/san1.litp
+    fi
+
+    SAN_TYPE=$($_CAT ${OUTPUT_DIR}/san1.litp | $_GREP 'san_type' | $_AWK '{print $2}')
+
+    USER=$($_CAT ${OUTPUT_DIR}/san1.litp | $_GREP username: | $_AWK '{print $2}')
+    IP_A=$($_CAT ${OUTPUT_DIR}/san1.litp | $_GREP ip_a: | $_AWK '{print $2}')
+    IP_B=$($_CAT ${OUTPUT_DIR}/san1.litp | $_GREP ip_b: | $_AWK '{print $2}')
+    PASSWORD_KEY=$($_CAT ${OUTPUT_DIR}/san1.litp | $_GREP password_key: | $_AWK '{print $2}')
+
+    $_ECHO ${SAN_TYPE} | $_GREP --silent -i vnx
+    if [ $? -eq 0 ] ; then
+        if [ ! -d ${DATAROOT}/${DATE}/clariion ] ; then
+            $_MKDIR ${DATAROOT}/${DATE}/clariion
+        fi
+        $_CAT > ${DATAROOT}/${DATE}/clariion/san.cfg <<EOF
+IP_A=${IP_A}
+IP_B=${IP_B}
+USER=${USER}
+GET_PASSWORD="${TOR_MONITORDIR}/getpw ${USER} ${PASSWORD_KEY}"
+EOF
+    else
+        $_ECHO ${SAN_TYPE} | $_GREP --silent -i unity
+        if [ $? -eq 0 ] ; then
+            if [ ! -d ${DATAROOT}/${DATE}/unity ] ; then
+                $_MKDIR ${DATAROOT}/${DATE}/unity
+            fi
+            $_CAT > ${DATAROOT}/${DATE}/unity/san.cfg <<EOF
+IP=${IP_A}
+USER=${USER}
+GET_PASSWORD=${TOR_MONITORDIR}/getpw ${USER} ${PASSWORD_KEY}
+EOF
+        fi
+    fi
+}
+
+collectCapacityInfo() {
+    local SRC_PATH=""
+    if [ -r /opt/ericsson/ERICenmcapacity/keyDimensioningValues.json ] ; then
+        SRC_PATH=/opt/ericsson/ERICenmcapacity/keyDimensioningValues.json
+    elif [ -r /opt/ericsson/enm-configuration/etc/keyDimensioningValues.json ] ; then
+        SRC_PATH=/opt/ericsson/enm-configuration/etc/keyDimensioningValues.json
+    fi
+    if [ -z "${SRC_PATH}" ] ; then
+        return
+    fi
+
+    initClusterDataDir
+    local CAPACTIY_DIR=${CLUSTEREDDATA_DIR}/capacity
+    if [ ! -d ${CAPACTIY_DIR} ] ; then
+        ${_MKDIR} ${CAPACTIY_DIR}
+    fi
+    ${_CP} -p ${SRC_PATH} ${CAPACTIY_DIR}
+}
+
+collectJBossSG() {
+    local STANDALONE_XML=/ericsson/3pp/jboss/standalone/configuration/standalone-enm.xml
+    if [ ! -r ${STANDALONE_XML} ] ; then
+        return
+    fi
+    # Only need to collect once
+    local JBOSS_SG_PATH=${OUTPUT_DIR}/jboss_sg.txt
+    if [ -s ${JBOSS_SG_PATH} ] ; then
+        return
+    fi
+    local JBOSS_SG=$($_RPM --query --whatprovides ${STANDALONE_XML} | $_SED -e 's/^ERICenmsg//' -e 's/_CXP.*//')
+    if [ ! -z "${JBOSS_SG}" ] ; then
+        $_ECHO "${JBOSS_SG}" > ${JBOSS_SG_PATH}
+    fi
+}
+
+createIloCfg() {
+    local ILO_DIR=${DATAROOT}/${DATE}/ilo
+    if [ -s ${ILO_DIR}/ilo.cfg ] ; then
+        return
+    fi
+
+    if [ -x /usr/bin/litp ] ; then
+        ILO_NODES=$(/usr/bin/litp show -p /infrastructure/systems -r -n 2 | grep system/bmc)
+        if [ ! -z "${ILO_NODES}" ] && [ ! -d ${ILO_DIR} ] ; then
+            ${_MKDIR} ${ILO_DIR}
+        fi
+        for NODE in $ILO_NODES ; do
+            HOST=$(echo $NODE | grep ^/infrastructure | awk -F/ '{print $4}')
+            ILO_TEMP=/tmp/ilo_node
+            [ -f $ILO_TEMP ] && rm -f $ILO_TEMP
+            /usr/bin/litp show -p $NODE > $ILO_TEMP
+            USER=$(grep username $ILO_TEMP | awk '{print $2}' | sed 's/"//g')
+            IPADDRESS=$(grep ipaddress $ILO_TEMP | awk '{print $2}' | sed 's/"//g')
+            PASS_KEY=$(grep password_key $ILO_TEMP | awk '{print $2}' | sed 's/"//g')
+            echo "${HOST}@${IPADDRESS}@${USER}@${TOR_MONITORDIR}/getpw ${USER} ${PASS_KEY}" >> ${ILO_DIR}/ilo.cfg
+        done
+    elif [ -s /vol1/senm/etc/deploy_sed.yml ] ; then
+        local MGT_HOST_LIST=$($_EGREP "^esxi_host.*_vio_mgt_hostname:" /vol1/senm/etc/deploy_sed.yml | $_AWK '{print $2}' | $_EGREP -v '""' | $_SED 's/"//g')
+        if [ ! -z "${MGT_HOST_LIST}" ] ; then
+            if [ ! -d ${ILO_DIR} ] ; then
+                ${_MKDIR} ${ILO_DIR}
+            fi
+
+            for MGT_HOST in ${MGT_HOST_LIST} ; do
+                local HOST_KEY=$($_EGREP "^esxi_host.*_vio_mgt_hostname: \"${MGT_HOST}\"" /vol1/senm/etc/deploy_sed.yml | $_AWK -F_ '{print $2}')
+                local IPADDRESS=$($_EGREP "^esxi_${HOST_KEY}_ip_ilo:" /vol1/senm/etc/deploy_sed.yml | $_AWK '{print $2}' | $_SED 's/"//g')
+                local USER=$($_EGREP "^esxi_${HOST_KEY}_ilo_user:" /vol1/senm/etc/deploy_sed.yml | $_AWK '{print $2}' | $_SED 's/"//g')
+                echo "${MGT_HOST}@${IPADDRESS}@${USER}@${TOR_MONITORDIR}/getIloPw $HOST_KEY" >> ${ILO_DIR}/ilo.cfg
+            done
+        fi
+    fi
+}
+
+collectASREnabledFields() {
+    FILE="/ericsson/tor/data/asrl/nodeFilter/.asrconfiguration_ASR-L.json"
+    if [ ! -r ${FILE} ] ; then
+        return
+    fi
+
+    ASRL_DIR=${CLUSTEREDDATA_DIR}/asrl
+    if [ ! -d ${ASRL_DIR} ] ; then
+        ${_MKDIR} ${ASRL_DIR}
+    fi
+
+    $_CP ${FILE} ${ASRL_DIR}
+}
+
+collectCmLog() {
+    local MY_SERVICE_GROUP="$1"
+    local NETYPE_SG_MAPPING_DIR=${CLUSTEREDDATA_DIR}/Netype_SG_Mapping
+
+    $_ECHO "${MY_SERVICE_GROUP}" | $_EGREP --silent "mssnmpcm|mscmip|comecimmscm"
+    if [ $? -ne 0 ] ; then
+        return
+    fi
+
+   #Service Group name is comecimmscm but in hosts file the name is mscmce-1-internal, So need to reassign SERVICE_GROUP
+    local SERVICE_GROUP="${MY_SERVICE_GROUP}"
+    if [ ${SERVICE_GROUP} == "comecimmscm" ] ; then
+         SERVICE_GROUP="mscmce"
+    fi
+
+    # We only want to collect this from the first mssnmpcm,mscmip,mscmce VM
+    isSgInstance ${SERVICE_GROUP} 1
+    if [ "${IS_SG_INST_RESULT}" != "true" ] ; then
+        return
+    fi
+
+    for FILE in CM_SNMPSG.JSON CM_CMIPSG.json CM_CMCESG.json ; do
+        if [ -f /opt/ericsson/ddp-utils/${FILE} ] ; then
+             if [ ! -d ${NETYPE_SG_MAPPING_DIR} ]; then
+                 ${_MKDIR} ${NETYPE_SG_MAPPING_DIR}
+             fi
+             ${_CP} /opt/ericsson/ddp-utils/${FILE} ${NETYPE_SG_MAPPING_DIR}/netypes_${MY_SERVICE_GROUP}.json
+             logInfo "Collection of ${FILE} : Success"
+        fi
+    done
+}
+
+collectPib() {
+    initClusterDataDir
+    if [ -z "${CLUSTEREDDATA_DIR}" ] ; then
+        return
+    fi
+
+    local POSTGRES_OUTDIR=${CLUSTEREDDATA_DIR}/postgres
+    if [ ! -d ${POSTGRES_OUTDIR} ] ; then
+        mkdir -p ${POSTGRES_OUTDIR}
+    fi
+
+    get_pg_pass
+    setPsqlBase
+    if [ -z "${PSQL_BASE}" ] ; then
+        return
+    fi
+
+    local PSQL="${PSQL_BASE} --dbname=sfwkdb --tuples-only --no-align"
+    local QUERY="select name,last_modification_time,single_value from configuration_parameter where status like 'MODIFIED'";
+    PGPASSWORD=${PG_PASS} ${PSQL} --command="${QUERY}" --output ${POSTGRES_OUTDIR}/pib.txt
+}
+
+### The command "hostname -i" in a Dual Stack machine returns a list of IPs.
+### We should prefer IPv4 address for internal communication.
+isIpv4() {
+    local IP=$1
+    if [[ $IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+getLocalIp() {
+    local IP_LIST=$(hostname -i)
+    for IP in $IP_LIST; do
+        isIpv4 $IP
+        if [ $? -eq 0 ]; then
+            echo $IP
+            break
+        fi
+    done
+}

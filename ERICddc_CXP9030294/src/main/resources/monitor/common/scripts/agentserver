@@ -1,0 +1,20 @@
+#!/bin/bash -a
+#
+
+MONITORDIR=$(dirname $0)
+MONITORDIR=$(cd ${MONITORDIR} 2>/dev/null && pwd || echo ${MONITORDIR})
+DDCDIR=$(cd ${MONITORDIR}/i../../../ 2>/dev/null && pwd || echo ${MONITORDIR}/../../../)
+AGENTDIR=${DDCDIR}
+UTILDIR=${DDCDIR}/util
+
+source ${UTILDIR}/bin/getCfg
+
+# Add in JMX
+JAVAFLAGS="-Dcom.sun.management.jmxremote"
+
+# limit the memory
+JAVAFLAGS="${JAVAFLAGS} -Xmx8m"
+
+CLASSPATH=${AGENTDIR}/lib/javaagent.jar:${CLASSPATH}
+
+exec ${JAVA_HOME}/bin/java -Ds=DDC_AGENTSVR ${JAVAFLAGS} com.ericsson.cifwk.diagmon.agent.rmiserver.AgentServer $*

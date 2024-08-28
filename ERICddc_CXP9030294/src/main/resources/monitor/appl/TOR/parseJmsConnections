@@ -1,0 +1,21 @@
+#!/bin/bash
+"true" '''\'
+P=$(which python3 2>/dev/null) || P=$(which python); exec $P "$0" "$@"
+'''
+
+import json,sys,re
+from collections import defaultdict
+
+countByIp = defaultdict(int)
+
+connections = json.load(sys.stdin)
+
+p = re.compile('^/([\d\.]+):\d')
+for connection in connections:
+ match = re.match(p, connection['clientAddress'])
+ if match:
+  ip = match.group(1)
+  countByIp[str(ip)] += 1
+
+for ip, count in countByIp.iteritems():
+ print("%s %s" % (ip,count))

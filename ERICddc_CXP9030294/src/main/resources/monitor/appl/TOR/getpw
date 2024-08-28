@@ -1,0 +1,14 @@
+#!/bin/bash
+"true" '''\'
+P=$(which python3 2>/dev/null) || P=$(which python); exec $P "$0" "$@"
+'''
+
+import sys
+
+from litp.core.base_plugin_api import BasePluginApi
+from litp.core.model_manager import ModelManager
+
+model_manager = ModelManager()
+base_api = BasePluginApi(model_manager)
+passwd = base_api.get_password(sys.argv[2], sys.argv[1])
+print(passwd)

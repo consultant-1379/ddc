@@ -1,0 +1,282 @@
+#!/bin/bash
+
+SFTP_USERNAME="upload"
+SFTP_PASSWORD="_!upLoad"
+DDCDIR="/opt/ericsson/ERICddc"
+source ${DDCDIR}/etc/global.env
+SITE_FTP_USERNAME="lmi_$(hostname)"
+DDP_HOST="ddpi.athtem.eei.ericsson.se"
+
+function displayHelpMessage() {
+    $_CAT <<-EOF
+
+        NAME
+        $($_BASENAME  $0) - Upload DDC data to a DDP site
+
+        DESCRIPTION
+        $($_BASENAME  $0) will upload DDC data to a DDP site. It will first call DDC to create a tar.gz of the data unless the -u flag is supplied.
+        By default, the current hostname is used when uploading data but this can be changed with the -s flag.
+        Data is uploaded to the DDPI server by default but this can be changed by supplying ddp server name, e.g "ddpenm2" after the -d flag.
+        For the servers in non-ECN networks, an interim server with the Linux OS can be used as a hop host server to upload the data to the required ddp servers. This can be achieved by setting the -H, -U, -P flags.
+
+        SYNOPSIS
+        $($_BASENAME  $0) [-h] [-u] [-v] [-d DDP_HOST] [-s SITE_NAME] -H [HOP_HOST] -U [HOP_USERID] -P [HOP_PASSWORD] -T [SFTP_TIMEOUT]
+
+        USAGE
+        -h      help            Display information and help about this utility.
+        -u      Upload only     Will not call DDC to create a DDC data file (tar.gz), but instead will upload data files that have already been created.
+        -d      DDP_HOST        Upload data to DDP_HOST instead of the default of "ddpi". DDP_HOST can be "ddpi", "ddpst", or "ddpa".
+        -s      SITE_NAME       The name of the site for which the data is to be uploaded to (excluding the 'lmi_' prefix). NB: Must be used when uploading from a vApp.
+        -v      Verbose         Display additional information while script is running.
+        -H      HOP_HOST        HOP_HOST can be any interim server where the tar.gz file can be uploaded to. Either the name or the ipaddress of the interim server can be passed as an argument to this flag.
+        -U      HOP_USERID      The Userid that needs to be used to connect and upload the ddc tar.gz file to the interim server.
+        -P      HOP_PASSWORD    The password to connect to the interim server as the HOP_USERID.
+        -T      SFTP_TIMEOUT    The time in seconds allowed for the sftp put command where data is sent from DDC to the DDP server. Default is 10.
+
+EOF
+}
+
+function main() {
+     $_ECHO -e "\n################ [$($_DATE)] Started ddcDataUpload script to upload the data to DDP [${DDP_HOST}] server ################\n"
+
+    preChecks
+
+    if [ ! -z ${SITE_FTP_PASSWORD} ] ; then
+        SITE_FTP_USERNAME="lmi${SITE_FTP_PASSWORD}"
+    fi
+
+    if [ ! -s ${SITEDATAROOT}/config/ddp.txt ] ; then
+        $_ECHO "${SITE_FTP_USERNAME}" > ${SITEDATAROOT}/config/ddp.txt
+    fi
+
+    if [ "${UPLOAD_ONLY}" != true ] ; then
+        $_RM "${DATAROOT}/DDC_Data_${DATE}.tar.gz" 2>/dev/null
+        removeSymlink
+        ${DDCDIR}/bin/ddc ${FILE_TYPE}
+        waitForDataFileCreation
+    fi
+
+    removeSymlink
+    uploadDataFiles
+
+    $_ECHO -e "\n####################### [$($_DATE)] Upload Complete to DDP [${DDP_HOST}] server ######################\n"
+}
+
+function preChecks() {
+
+    # Check this isn't happening at midnight
+    if [ "${TIME}" == "00:00" ] ; then
+        $_ECHO "Should not run this at midnight" >&2
+        exit 1
+    fi
+
+    if [ -z "${DATAROOT}" ] ; then
+        $_ECHO "[$($_DATE)] ERROR: No ${DATAROOT} defined after sourcing global.env" >&2
+        exit 1
+    fi
+
+    STATUS="$($_SERVICE ddc status)"
+    if [[ "${STATUS}" != *"running"* ]] ; then
+        $_ECHO "[$($_DATE)] ERROR: Exiting as DDC is not running: ${STATUS}" >&2
+        exit 1
+    fi
+}
+
+function removeSymlink() {
+
+    for file in ${DATAROOT}/DDC_Data_*-*; do
+        if [[ -L "$file" ]]; then unlink ${file}; fi
+    done
+
+}
+
+function waitForDataFileCreation() {
+    $_ECHO -en "\n... [$($_DATE)] Waiting for data file to be generated...\n"
+    # DDC will wait for 1800 secs for hosts/VMs to generate
+    # their tarball, so wait an additional 15 mins for the
+    # main tarball to be generated
+    # If the user has configured a timeout under '/var/
+    # ericsson/ddc_data/config/DDC_DATA_UPLOAD_TIMEOUT_SECS'
+    # then use that timeout instead of the default 2700 sec
+    TIMEOUT_REMAINING=2700
+    if [ -r "${SITEDATAROOT}/config/DDC_DATA_UPLOAD_TIMEOUT_SECS" ] ; then
+        TIMEOUT_REMAINING=$(cat ${SITEDATAROOT}/config/DDC_DATA_UPLOAD_TIMEOUT_SECS | $_EGREP -v "^\s*#|^\s*$" | $_HEAD -n 1)
+    fi
+
+    # Wait until MAKETAR is done with generating today's DDC data file
+    while [ "${TIMEOUT_REMAINING}" -gt 0 ] ; do
+        $_SLEEP 30
+        if [ "${FILE_TYPE}" = "MAKETAR" ] ; then
+            if [ -r "${DATAROOT}/DDC_Data_${DATE}.tar.gz" ] ; then
+                break
+            fi
+        elif [ "${FILE_TYPE}" = "DELTA" ] ; then
+            DELTA_FILES=$($_FIND ${DATAROOT} -maxdepth 1 -name "DDC_Delta_${DATE}_*.tar.gz")
+            if [ ! -z ${DELTA_FILES} ] ; then
+                break
+            fi
+        fi
+        TIMEOUT_REMAINING="$(expr ${TIMEOUT_REMAINING} - 30)"
+    done
+
+    if [ ${TIMEOUT_REMAINING} -eq 0 ]; then
+       $_ECHO -e "\n... [$($_DATE)] ERROR: Timeout while generating DDC_Data file...\n" >&2
+       exit 1
+    fi
+    $_ECHO -en "\n... [$($_DATE)] waitForDataFileCreation done...\n"
+}
+
+function uploadDataFiles() {
+    if [ "${FILE_TYPE}" = "MAKETAR" ] ; then
+        FILE_LIST="$($_FIND ${DATAROOT} -maxdepth 1 -name 'DDC_Data_*.tar.gz' -printf "%f ")"
+    elif [ "${FILE_TYPE}" = "DELTA" ] ; then
+        FILE_LIST="$($_FIND ${DATAROOT} -maxdepth 1 -name "DDC_Delta_${DATE}_*.tar.gz" -printf "%f ")"
+    fi
+
+    if [ -z "${FILE_LIST}" ] ; then
+        $_ECHO -en "\n... [$($_DATE)] No ddc tar.gz files found to upload...\n" >&2
+        exit 0
+    fi
+
+    for FILE in ${FILE_LIST} ; do
+
+        if [ ! -z "${HOP_HOST}" ] && [ ! -z "${HOP_USERID}" ] && [ ! -z "${HOP_PASSWORD}" ] ; then
+            $_ECHO -en "\n... [$($_DATE)] Uploading ${FILE} to the Hophost server [${HOP_HOST}] using FTP Protocol...\n"
+            HOSTNAME=$(hostname)
+            $_FTP -dvn  ${HOP_HOST} <<EOF >> ${DATAROOT}/uploaded/log 2>&1
+            user ${HOP_USERID} ${HOP_PASSWORD}
+            bin
+            prompt
+            lcd ${DATAROOT}
+            put ${FILE} ${HOSTNAME}/${FILE}
+            quit
+EOF
+            $_ECHO -en "\n... [$($_DATE)] Connecting to the Hophost server [${HOP_HOST}] using SSH Protocol in order to ftp the ${FILE} to the DDP [${DDP_HOST}] server...\n"
+
+            $_EXPECT <<-EOF >> ${DATAROOT}/uploaded/log 2>&1
+            spawn $_SSH -q -o UserKnownHostsFile=/dev/null -o CheckHostIP=no -o StrictHostKeyChecking=no ${HOP_USERID}@${HOP_HOST}
+            expect { "yes/no)?" { send "yes\r"}
+            }
+            expect {
+            -nocase "Password: " { send "${HOP_PASSWORD}\r"}
+                timeout {puts stderr "ERROR: Timeout connecting to ${HOP_HOST}"; exit 1}
+                eof {puts stderr \$expect_out(buffer); exit 1}
+            }
+            expect -re {[%#>$] ?$} {
+             send "$_FTP -n ${DDP_HOST}\r"
+            }
+            expect {
+            -ex "ftp> " { send "user ${SITE_FTP_USERNAME} ${SITE_FTP_PASSWORD}\r"}
+            }
+            expect {
+            -ex "ftp> " { send "bin\r"}
+            }
+            expect {
+            -ex "ftp> " { send "prompt\r"}
+            }
+            expect {
+            -ex "ftp> " { send "lcd ${HOSTNAME}\r"}
+            }
+            expect {
+            -ex "ftp> " { set timeout 600 ; send "mput ${FILE}\r"}
+            }
+            expect {
+            -ex "ftp> " { send "quit\r"}
+            }
+            expect -re {[>%#$] ?$} {
+             send "$_RM -f ${HOSTNAME}/${FILE}\r"
+            }
+            expect -re {[#%$>] ?$} {
+             send "exit\r"
+            }
+EOF
+            $_ECHO -en "\n... [$($_DATE)] Uploading ${FILE} to the DDP [${DDP_HOST}] server is done with the help of the Hophost [${HOP_HOST}] server...\n"
+    elif [ -z "${HOP_HOST}" ] ; then
+            $_ECHO -en "\n... [$($_DATE)] Uploading ${FILE} to the DDP [${DDP_HOST}] server...\n"
+            $_EXPECT <<- EOF
+            log_user 0
+            spawn $_SFTP -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ${SFTP_USERNAME}@${DDP_HOST}
+            expect {
+                -nocase "password" { send "${SFTP_PASSWORD}\r"}
+                timeout {puts stderr "ERROR: Timeout uploading to DDP"; exit 1}
+                eof {puts stderr \$expect_out(buffer); exit 1}
+            }
+            expect {
+                -nocase "password" {puts stderr \$expect_out(buffer);  exit 1}
+                "sftp>" { set timeout ${SFTP_TIMEOUT} ; send "put ${DATAROOT}/${FILE} ${SITE_FTP_USERNAME}@${FILE}\r" }
+                timeout {puts stderr "ERROR: Timeout uploading to DDP server";puts stderr \$expect_out(buffer); exit 1}
+                eof {puts stderr \$expect_out(buffer); exit 1}
+            }
+            expect {
+                "100%" {}
+                "%" {exp_continue}
+                # Things are OK if we are getting new percent updates, but still wait for 100%
+                timeout {puts stderr "ERROR: Timeout uploading to DDP";puts stderr \$expect_out(buffer); exit 1}
+                eof {puts stderr \$expect_out(buffer); exit 1}
+            }
+            expect "sftp>" {send "quit\r"}
+            expect eof
+EOF
+            # Exit if SFTP command was unsuccessful
+            if [ $? -ne 0 ]; then
+                $_ECHO -e "\n... [$($_DATE)] Exiting the script as the SFTP command was unsuccessful...\n"
+                exit $?;
+            fi;
+    else
+        $_ECHO -e "\n... Exiting the script as there are missing details of HOP USERID or HOP PASSWORD or the both to make use of the HOP HOST functionality...\n" >&2
+        exit 1
+    fi
+        $_MV ${DATAROOT}/${FILE} ${DATAROOT}/uploaded
+        $_ECHO -e "\n... [$($_DATE)] Upload of ${FILE} to DDP and moving of the ${DATAROOT}/${FILE} to ${DATAROOT}/uploaded/ is done...\n"
+
+    done
+    avail_space=$($_DF -P ${DATAROOT}/uploaded | ${_TAIL} --lines 1 | $_TR -s " " | $_CUT -d" " -f4)
+    if [[ ${avail_space} -lt 2000000 ]] ; then
+        $_RM -rf ${DATAROOT}/uploaded/DDC_Data_*.tar.gz
+        $_ECHO -e "\n... [$($_DATE)] DDC tar.gz files are deleted from ${DATAROOT}/uploaded directory due to low space...\n"
+    fi
+}
+
+LOCK_FILE="/var/lock/ddcDataUpload"
+
+exec 99>"$LOCK_FILE"
+$_FLOCK -n 99
+
+if [ $? -ne 0 ]; then
+    $_ECHO -e "Exiting as ddcDataUpload is already running. Try againg later." >&2
+    exit 1
+fi
+
+FILE_TYPE=MAKETAR
+SFTP_TIMEOUT=10
+while getopts "uhvd:s:H:U:P:t:T" opt; do
+    case $opt in
+        v ) VERBOSE=true ;;
+        u ) UPLOAD_ONLY=true ;;
+        d ) DDP_HOST="${OPTARG}.athtem.eei.ericsson.se" ;;
+        s ) SITE_FTP_PASSWORD="_${OPTARG}" ;;
+        H ) HOP_HOST="${OPTARG}" ;;
+        U ) HOP_USERID="${OPTARG}" ;;
+        P ) HOP_PASSWORD="${OPTARG}" ;;
+        h ) displayHelpMessage; exit 0 ;;
+        t ) FILE_TYPE="${OPTARG}" ;;
+        T ) SFTP_TIMEOUT="${OPTARG}";  ;;
+        * ) $_ECHO "Invalid flag ${opt}; use -h for help"; exit 1 ;;
+    esac
+done
+
+if [ ! -d "${DATAROOT}/uploaded" ] ; then
+    $_MKDIR ${DATAROOT}/uploaded
+    if [ $? -eq 0 ] ; then
+        logger -t DDC -p user.info "INFO: ${DATAROOT}/uploaded directory created"
+    else
+        logErrorAndDie "Failed to created ${DATAROOT}/uploaded"
+    fi
+fi
+
+if [ "${VERBOSE}" == true ]; then
+    main | $_TEE -a ${DATAROOT}/uploaded/log
+else
+    # Redirect stdout and error to log, stderr to screen
+    main 2>&1 >> ${DATAROOT}/uploaded/log | $_TEE -a ${DATAROOT}/uploaded/log
+fi

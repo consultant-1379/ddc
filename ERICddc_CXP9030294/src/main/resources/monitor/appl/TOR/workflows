@@ -1,0 +1,77 @@
+#!/opt/rh/rh-python38/root/bin/python3
+
+import requests
+import logging
+import json
+from datetime import datetime
+import getopt, sys
+import re
+
+def get(base_url, uri):
+    full_url = "{0}{1}".format(base_url, uri)
+    response = requests.get(full_url)
+    response_code = response.status_code
+    logging.debug("get: full_url=%s code=%d text=%s", full_url, response_code, response.text)
+    return response.json()
+
+def main():
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "d:s:v")
+    except getopt.GetoptError as err:
+        print(str(err))  # will print something like "option -a not recognized"
+        sys.exit(2)
+
+    parameters = {
+        'log_level': logging.WARN,
+        'date': None,
+        'max_size': 1024 * 1024 * 1024
+    }
+
+    for o, a in opts:
+        if o == "-d":
+            parameters['date'] = a
+        elif o == "-s":
+            parameters['max_size'] = int(a)
+        elif o == "-v":
+            parameters['log_level'] = logging.DEBUG
+        else:
+            assert False, "unhandled option"
+
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s',
+                        level=parameters['log_level'])
+
+    # Figure out whic port we're using
+    url = "http://vnflaf-int:8080"
+    try:
+        response = requests.head("{0}/wfs/rest/progresssummaries".format(url))
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        url = "http://vnflaf-int:80"
+
+    parameters['date'] = datetime.strptime(parameters['date'], '%Y-%m-%d').strftime('%y-%m-%d')
+    dateRegexPattern = "^.{,2}" + parameters['date']
+
+    progressSummaries = get(url, '/wfs/rest/progresssummaries')
+    output_size = 0
+
+    matchedWorkflows = []
+    for progressSummary in progressSummaries:
+        if ( ( progressSummary['startTime'] is not None and re.search(dateRegexPattern, progressSummary['startTime']) ) or
+             ( progressSummary['endTime'] is not None and re.search(dateRegexPattern, progressSummary['endTime']) ) ):
+            matchedWorkflows.append(progressSummary)
+
+    print(json.dumps(matchedWorkflows))
+
+    for workflow in matchedWorkflows:
+        events = get(url, '/wfs/rest/progressevents?instanceId=%s' % workflow['instanceId'])
+        output_str = json.dumps(events)
+        output_size = output_size + len(output_str)
+        if output_size > parameters['max_size']:
+            print(json.dumps( { 'error': 'max_size exceeded' } ))
+            sys.exit(1)
+        else:
+            print(output_str)
+
+if __name__ == "__main__":
+    main()
+

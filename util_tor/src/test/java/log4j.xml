@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?><Configuration>
+<!-- this file sends output logging to log4j.log in the current directory.
+
+	If you want to turn off or alter logging during the tests, hack this file around.
+	
+	The name 'log4j.log' is printed in the debug output.
+-->
+  <Appenders>
+    <Console name="consoleAppender" target="SYSTEM_OUT">
+      <PatternLayout pattern="%d{dd MMM yyyy HH:mm:ss} %5p %c{1} - %m%n"/>
+    </Console>
+
+    <RollingFile name="fileAppender" fileName="log4j.log" append="false">
+      <PatternLayout>
+        <Pattern>%d{ABSOLUTE} %-5p [%c{1}] %m%n</Pattern>
+      </PatternLayout>
+    </RollingFile>
+
+    <Loggers>
+      <Root level="warn">
+        <AppenderRef ref="fileAppender"/>
+      </Root>
+    </Loggers>
+  </Appenders>
+</Configuration>
